@@ -4,7 +4,7 @@ name: dalec-rpm-frontend
 description: A test fixture which builds this project as an RPM, mainly to validate generating sources from a command.
 website: https://www.github.com/Azure/dalec
 version: 0.0.1
-revision: 1
+revision: "1"
 vendor: Microsoft
 
 packager: Microsoft <support@microsoft.com>

@@ -18,6 +18,12 @@
 #ImageDigest: =~"\(#ImageDigest)"
 #ImageRef:    =~"\(#_ImageRef)"
 
+#_Semver: #"^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)(?:-(?P<prerelease>(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+(?P<buildmetadata>[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$"#
+#Semver:  =~"\(#_Semver)"
+
+#_Digits: "[0-9]+"
+#Digits:  =~"\(#_Digits)"
+
 #Map: {
 	[#Identifier]: _
 }
@@ -109,6 +115,23 @@
 }
 
 sourceMap: #SourceMap
+
+doc: {
+	#Metadata
+	sources: #SourceMap
+	...
+}
+
+#Metadata: {
+	name:        #NonEmptyNonNullString
+	version:     #Semver | "${VERSION}"
+	revision:    *"0" | #Digits | "${REVISION}"
+	packager:    #NonEmptyNonNullString
+	vendor:      #NonEmptyNonNullString
+	license:     #NonEmptyNonNullString
+	description: #NonEmptyNonNullString
+	website:     #NonEmptyNonNullString
+}
 
 srcMap: #SourceMap & {
 	hello: {

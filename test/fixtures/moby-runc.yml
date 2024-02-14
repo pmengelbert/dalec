@@ -5,7 +5,7 @@
 
 args:
   RUNC_COMMIT:
-  REVISION: 1
+  REVISION: "1"
   VERSION:
 
 name: moby-runc

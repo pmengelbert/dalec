@@ -3,7 +3,7 @@ name: dalec-test-fixture-env-multi-command-step
 description: A test fixture for checking http sources
 website: https://www.github.com/Azure/dalec
 version: 0.0.1
-revision: 1
+revision: "1"
 vendor: Microsoft
 
 packager: Microsoft <support@microsoft.com>
