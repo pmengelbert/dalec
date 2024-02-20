@@ -309,7 +309,7 @@ func LoadSpec(dt []byte) (*Spec, error) {
 // LoadSpec loads a spec from the given data.
 func LoadSpecs(b []byte) ([]*Spec, error) {
 	f := bytes.NewBuffer(b)
-	y := yaml.NewDecoder(f)
+	y := yaml.NewDecoder(f, yaml.Strict())
 	specs := []*Spec{}
 	for {
 		var spec Spec
@@ -318,7 +318,7 @@ func LoadSpecs(b []byte) ([]*Spec, error) {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("error unmarshalling spec: %w", err)
 		}
 
 		specs = append(specs, &spec)
@@ -326,6 +326,13 @@ func LoadSpecs(b []byte) ([]*Spec, error) {
 
 	if len(specs) == 0 {
 		return nil, fmt.Errorf("no specs provided")
+	}
+
+	for _, spec := range specs {
+		if err := spec.Validate(); err != nil {
+			return nil, err
+		}
+		spec.FillDefaults()
 	}
 
 	return specs, nil
