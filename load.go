@@ -333,6 +333,11 @@ func LoadSpecs(b []byte) ([]*Spec, error) {
 			return nil, err
 		}
 		spec.FillDefaults()
+
+		args := DuplicateMap(spec.Args)
+		if err := spec.SubstituteArgs(args); err != nil {
+			return nil, err
+		}
 	}
 
 	return specs, nil
