@@ -31,6 +31,22 @@ func tdnfCacheMountWithPrefix(prefix string) llb.RunOption {
 	return llb.AddMount(filepath.Join(prefix, tdnfCacheDir), llb.Scratch(), llb.AsPersistentCacheDir(tdnfCacheName, llb.CacheMountLocked))
 }
 
+func hasSigner(t *dalec.Target) bool {
+	return t != nil && t.PackageConfig != nil && t.PackageConfig.Signer != nil && t.PackageConfig.Signer.Image != nil
+}
+
+func forwardToSigner(signer *dalec.Signer) (llb.StateOption, error) {
+	var o dalec.SourceOpts
+	imgState, err := signer.Image.AsState("signer", "/", o)
+	if err != nil {
+		return nil, err
+	}
+
+	return func(s llb.State) llb.State {
+		return imgState
+	}, nil
+}
+
 func handleRPM(ctx context.Context, client gwclient.Client) (*gwclient.Result, error) {
 	return frontend.BuildWithPlatform(ctx, client, func(ctx context.Context, client gwclient.Client, platform *ocispecs.Platform, spec *dalec.Spec, targetKey string) (gwclient.Reference, *dalec.DockerImageSpec, error) {
 		if err := rpm.ValidateSpec(spec); err != nil {
@@ -46,6 +62,16 @@ func handleRPM(ctx context.Context, client gwclient.Client) (*gwclient.Result, e
 		st, err := specToRpmLLB(spec, sOpt, targetKey, pg)
 		if err != nil {
 			return nil, nil, err
+		}
+
+		t := spec.Targets[targetKey]
+		if hasSigner(&t) {
+			signTransform, err := forwardToSigner(t.PackageConfig.Signer)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			st = st.With(signTransform)
 		}
 
 		def, err := st.Marshal(ctx, pg)
@@ -64,6 +90,7 @@ func handleRPM(ctx context.Context, client gwclient.Client) (*gwclient.Result, e
 		if err != nil {
 			return nil, nil, err
 		}
+
 		return ref, nil, nil
 	})
 }
