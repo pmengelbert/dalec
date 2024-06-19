@@ -1,0 +1,135 @@
+# syntax=ghcr.io/azure/dalec/frontend:0.5.0
+
+name: k3s
+version: 1.30.0
+revision: "1"
+packager: Azure Container Upstream
+vendor: Microsoft
+license: Apache
+description: "Lightweight Kubernetes. Production ready, easy to install, half the memory, all in a binary less than 100 MB."
+website: https://github.com/k3s-io/k3s
+
+# x-commit: &commit
+#
+
+args:
+  VERSION_RUNC: v1.1.12-k3s1
+  VERSION_ROOT: v0.13.0
+  ARCH: amd64
+  CHARTS_URL: https://k3s.io/k3s-charts/assets
+
+sources:
+  k3s:
+    generate:
+      - gomod: {}
+    git:
+      url: https://github.com/k3s-io/k3s.git
+      commit: v1.30.0+k3s1
+  runc:
+    generate:
+      - gomod: {}
+    git:
+      url: https://github.com/k3s-io/runc.git
+      commit: v1.1.12-k3s1
+  root:
+    http:
+      url: https://github.com/k3s-io/k3s-root/releases/download/${VERSION_ROOT}/k3s-root-${ARCH}.tar
+  containerd:
+    git:
+      url: https://github.com/k3s-io/containerd.git
+      commit: v1.7.17-k3s1
+      keepGitDir: true
+  charts:
+    path: /charts
+    image:
+      ref: azurelinuxpreview.azurecr.io/public/azurelinux/base/core:3.0
+      cmd:
+        mounts:
+          - dest: /src/k3s
+            spec:
+              git:
+                url: https://github.com/k3s-io/k3s.git
+                commit: v1.30.0+k3s1
+                keepGitDir: true
+          - dest: /scripts
+            spec:
+              inline:
+                dir:
+                  files:
+                    install.sh: 
+                      contents: |
+                        #!/usr/bin/env bash
+
+                        set -exo pipefail
+                        tdnf -y install golang git
+                        mkdir -p /charts
+                        cd /src/k3s
+                        . ./scripts/version.sh
+
+                        BINARY=yq
+                        VERSION=v4.44.2
+                        curl -fsSL 'https://github.com/mikefarah/yq/releases/download/${VERSION}/${BINARY}' -O
+                        chmod +x yq
+
+                        https://github.com/mikefarah/yq/releases/download/${VERSION}/${BINARY}.tar.gz
+
+                        export CHARTS_DIR=/charts
+                        export CHARTS_URL=https://k3s.io/k3s-charts/assets
+
+                        # fetch the charts into /charts
+                        for CHART_FILE in $(grep -rlF HelmChart manifests/ | xargs ./yq eval --no-doc .spec.chart | xargs -n1 basename); do
+                          CHART_NAME=$(echo $CHART_FILE | grep -oE '^(-*[a-z])+')
+                          curl -sfL ${CHARTS_URL}/${CHART_NAME}/${CHART_FILE} -o ${CHARTS_DIR}/${CHART_FILE}
+                        done
+                  permissions: 755
+            spec:
+              git:
+                url: https://github.com/k3s-io/k3s.git
+                commit: v1.30.0+k3s1
+                keepGitDir: true
+        dir: /
+        steps:
+          - command: /scripts/install.sh
+
+  # dockerfile.local:
+  #   path: /
+  #   build:
+  #     source:
+  #       git:
+  #         url: https://github.com/k3s-io/k3s.git
+  #         commit: v1.30.0+k3s1
+  #         keepGitDir: true
+  #     dockerfile_path: ./Dockerfile.local
+  #     target: result
+
+
+  # mkdownload:
+  #   path: /
+  #   image:
+  #     ref: azurelinuxpreview.azurecr.io/public/azurelinux/base/core:3.0
+  #     cmd:
+  #       mounts:
+  #         - dest: /opt/src/k3s
+  #           spec:
+  #             git:
+  #               url: https://github.com/k3s-io/k3s.git
+  #               commit: v1.30.0+k3s1
+  #       steps:
+  #         - command: |
+  #             set -ex
+  #             tdnf install -y make ca-certificates golang
+  #             cd /opt/src/k3s
+  #             scripts/download
+
+dependencies:
+  build:
+    golang:
+
+build:
+  steps:
+    - command: |
+        cd k3s
+        mkdir -p build/data
+        # make download
+        make generate
+
