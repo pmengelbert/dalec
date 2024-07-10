@@ -546,6 +546,44 @@
 			"description": "PostInstall is the post install configuration for the image."
 		},
 		"Source": {
+			"oneOf": [
+				{
+					"required": [
+						"image"
+					],
+					"title": "image"
+				},
+				{
+					"required": [
+						"git"
+					],
+					"title": "git"
+				},
+				{
+					"required": [
+						"http"
+					],
+					"title": "http"
+				},
+				{
+					"required": [
+						"context"
+					],
+					"title": "context"
+				},
+				{
+					"required": [
+						"build"
+					],
+					"title": "build"
+				},
+				{
+					"required": [
+						"inline"
+					],
+					"title": "inline"
+				}
+			],
 			"properties": {
 				"image": {
 					"$ref": "#/$defs/SourceDockerImage",
@@ -626,7 +664,8 @@
 			"properties": {
 				"name": {
 					"type": "string",
-					"description": "Name is the name of the build context. By default, it is the magic name\n`context`, recognized by Docker as the default context."
+					"description": "Name is the name of the build context. By default, it is the magic name\n`context`, recognized by Docker as the default context.",
+					"default": "context"
 				}
 			},
 			"additionalProperties": false,
@@ -682,8 +721,7 @@
 			"type": "object",
 			"required": [
 				"url",
-				"commit",
-				"keepGitDir"
+				"commit"
 			]
 		},
 		"SourceHTTP": {

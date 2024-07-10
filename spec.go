@@ -289,7 +289,7 @@ type SourceDockerImage struct {
 type SourceGit struct {
 	URL        string `yaml:"url" json:"url"`
 	Commit     string `yaml:"commit" json:"commit"`
-	KeepGitDir bool   `yaml:"keepGitDir" json:"keepGitDir"`
+	KeepGitDir bool   `yaml:"keepGitDir" json:"keepGitDir,omitempty"`
 }
 
 // SourceHTTP is used to download a file from an HTTP(s) URL.
@@ -307,7 +307,7 @@ type SourceHTTP struct {
 type SourceContext struct {
 	// Name is the name of the build context. By default, it is the magic name
 	// `context`, recognized by Docker as the default context.
-	Name string `yaml:"name,omitempty" json:"name,omitempty"`
+	Name string `yaml:"name,omitempty" json:"name,omitempty" jsonschema:"default=context"`
 }
 
 // SourceInlineFile is used to specify the content of an inline source.
@@ -381,12 +381,12 @@ type Source struct {
 	// Exactly one must be non-nil, with all other cases being errors.
 	//
 	// === Begin Source Variants ===
-	DockerImage *SourceDockerImage `yaml:"image,omitempty" json:"image,omitempty"`
-	Git         *SourceGit         `yaml:"git,omitempty" json:"git,omitempty"`
-	HTTP        *SourceHTTP        `yaml:"http,omitempty" json:"http,omitempty"`
-	Context     *SourceContext     `yaml:"context,omitempty" json:"context,omitempty"`
-	Build       *SourceBuild       `yaml:"build,omitempty" json:"build,omitempty"`
-	Inline      *SourceInline      `yaml:"inline,omitempty" json:"inline,omitempty"`
+	DockerImage *SourceDockerImage `yaml:"image,omitempty" json:"image,omitempty" jsonschema:"oneof_required=image"`
+	Git         *SourceGit         `yaml:"git,omitempty" json:"git,omitempty" jsonschema:"oneof_required=git"`
+	HTTP        *SourceHTTP        `yaml:"http,omitempty" json:"http,omitempty" jsonschema:"oneof_required=http"`
+	Context     *SourceContext     `yaml:"context,omitempty" json:"context,omitempty" jsonschema:"oneof_required=context"`
+	Build       *SourceBuild       `yaml:"build,omitempty" json:"build,omitempty" jsonschema:"oneof_required=build"`
+	Inline      *SourceInline      `yaml:"inline,omitempty" json:"inline,omitempty" jsonschema:"oneof_required=inline"`
 	// === End Source Variants ===
 
 	// Path is the path to the source after fetching it based on the identifier.
