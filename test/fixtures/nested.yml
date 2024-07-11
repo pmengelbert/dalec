@@ -12,10 +12,7 @@ license: Apache 2.0
 noarch: true
 sources:
   src:
-    build:
-      source:
-        path: test/fixtures/nested
-        context: {}
+    path: /hello/world
 
 build:
   steps:
