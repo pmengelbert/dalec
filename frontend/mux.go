@@ -8,6 +8,7 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/Azure/dalec"
 	"github.com/containerd/platforms"
@@ -346,6 +347,11 @@ func (m *BuildMux) lookupTarget(ctx context.Context, target string) (matchedPatt
 func (m *BuildMux) Handle(ctx context.Context, client gwclient.Client) (_ *gwclient.Result, retErr error) {
 	// Cache the opts in case this is the raw client
 	// This prevents a grpc request for multiple calls to BuildOpts
+	wait := true
+	for wait {
+		time.Sleep(time.Second)
+	}
+
 	opts := client.BuildOpts().Opts
 	origOpts := dalec.DuplicateMap(opts)
 
