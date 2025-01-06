@@ -695,6 +695,12 @@ func (t *Target) processBuildArgs(name string, lex *shell.Lex, args map[string]s
 		}
 	}
 
+	if t.Image != nil {
+		if err := t.Image.processBuildArgs(lex, args); err != nil {
+			return fmt.Errorf("error processing image config build args: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -706,4 +712,17 @@ func (cfg *PackageConfig) processBuildArgs(lex *shell.Lex, args map[string]strin
 	}
 
 	return nil
+}
+
+func (i *ImageConfig) processBuildArgs(lex *shell.Lex, args map[string]string) error {
+	var errs error
+	for _, p := range []*string{&i.Base, &i.Cmd, &i.User, &i.Entrypoint, &i.StopSignal, &i.WorkingDir} {
+		updated, err := expandArgs(lex, *p, args)
+		if err != nil {
+			errs = goerrors.Join(errs, err)
+		}
+		*p = updated
+	}
+
+	return errs
 }
