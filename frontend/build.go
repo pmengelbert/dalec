@@ -150,3 +150,26 @@ func GetBaseImage(sOpt dalec.SourceOpts, ref string) llb.State {
 		return llb.Image(ref, llb.WithMetaResolver(sOpt.Resolver), dalec.WithConstraint(c)), nil
 	})
 }
+
+func DebugString(ctx context.Context, c gwclient.Client, s string) (gwclient.Reference, *dalec.DockerImageSpec, error) {
+	st := llb.Scratch().File(llb.Mkfile("/output", 0o644, []byte(s)))
+
+	def, err := st.Marshal(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	res, err := c.Solve(ctx, gwclient.SolveRequest{
+		Definition: def.ToPB(),
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	ref, err := res.SingleRef()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return ref, nil, nil
+}

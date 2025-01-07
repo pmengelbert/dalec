@@ -7,12 +7,14 @@ import (
 	"sync/atomic"
 
 	"github.com/Azure/dalec"
+	"github.com/containerd/platforms"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/frontend/dockerui"
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/opencontainers/go-digest"
+	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
 
@@ -91,6 +93,46 @@ func ForwarderFromClient(ctx context.Context, client gwclient.Client) dalec.Forw
 	}
 }
 
+func ForwarderFromClient2(ctx context.Context, client gwclient.Client, p *ocispecs.Platform) dalec.ForwarderFunc {
+	return func(st llb.State, spec *dalec.SourceBuild) (llb.State, error) {
+		if spec == nil {
+			spec = &dalec.SourceBuild{}
+		}
+
+		def, err := st.Marshal(ctx)
+		if err != nil {
+			return llb.Scratch(), err
+		}
+		defPb := def.ToPB()
+
+		dockerfileDt, err := getDockerfile(ctx, client, spec, defPb)
+		if err != nil {
+			return llb.Scratch(), err
+		}
+
+		req, err := newSolveRequest(
+			toDockerfile(ctx, st, dockerfileDt, spec, dalec.ProgressGroup("prepare dockerfile to forward to frontend")),
+			copyForForward(ctx, client),
+		)
+		if err != nil {
+			return llb.Scratch(), err
+		}
+
+		res, err := client.Solve(ctx, req)
+		if err != nil {
+			return llb.Scratch(), err
+		}
+
+		key := platforms.Format(*p)
+		ref, found := res.FindRef(key)
+		if !found {
+			return llb.Scratch(), fmt.Errorf("ref not found for platform: %s", key)
+		}
+
+		return ref.ToState()
+	}
+}
+
 func GetBuildArg(client gwclient.Client, k string) (string, bool) {
 	opts := client.BuildOpts().Opts
 	if opts != nil {
@@ -110,6 +152,33 @@ func SourceOptFromClient(ctx context.Context, c gwclient.Client) (dalec.SourceOp
 	return dalec.SourceOpts{
 		Resolver: c,
 		Forward:  ForwarderFromClient(ctx, c),
+		GetContext: func(ref string, opts ...llb.LocalOption) (*llb.State, error) {
+			if ref == dockerui.DefaultLocalNameContext {
+				return dc.MainContext(ctx, opts...)
+			}
+			st, _, err := dc.NamedContext(ctx, ref, dockerui.ContextOpt{
+				ResolveMode: dc.ImageResolveMode.String(),
+				AsyncLocalOpts: func() []llb.LocalOption {
+					return opts
+				},
+			})
+			if err != nil {
+				return nil, err
+			}
+			return st, nil
+		},
+	}, nil
+}
+
+func SourceOptFromClient2(ctx context.Context, c gwclient.Client, p *ocispecs.Platform) (dalec.SourceOpts, error) {
+	dc, err := dockerui.NewClient(c)
+	if err != nil {
+		return dalec.SourceOpts{}, err
+	}
+
+	return dalec.SourceOpts{
+		Resolver: c,
+		Forward:  ForwarderFromClient2(ctx, c, p),
 		GetContext: func(ref string, opts ...llb.LocalOption) (*llb.State, error) {
 			if ref == dockerui.DefaultLocalNameContext {
 				return dc.MainContext(ctx, opts...)

@@ -686,7 +686,7 @@ func Sources(spec *Spec, sOpt SourceOpts, opts ...llb.ConstraintsOpt) (map[strin
 
 		st, err := src.AsState(k, sOpt, opts...)
 		if err != nil {
-			return nil, errors.Wrapf(err, "could not get source stat e for source: %s", k)
+			return nil, errors.Wrapf(err, "could not get source state for source: %s", k)
 		}
 
 		states[k] = st
