@@ -588,3 +588,12 @@ func BaseImageConfig(platform *ocispecs.Platform) *DockerImageSpec {
 
 	return img
 }
+
+func PlatformString(p *ocispecs.Platform) string {
+	if p == nil {
+		panic("platform is nil")
+	}
+
+	pp := platforms.Normalize(*p)
+	return platforms.Format(pp)
+}

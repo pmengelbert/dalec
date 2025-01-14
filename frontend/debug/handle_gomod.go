@@ -34,15 +34,18 @@ func Gomods(ctx context.Context, client gwclient.Client) (*client.Result, error)
 			p = &pp
 		}
 
+		// opts := []llb.ConstraintsOpt{llb.Platform(*p)}
+		imgOpts := []llb.ImageOption{llb.WithMetaResolver(client), llb.Platform(*p)}
+
 		// Allow the client to override the worker image
 		// This is useful for keeping pre-built worker image, especially for CI.
 		worker, ok := inputs[keyGomodWorker]
 		if !ok {
-			worker = llb.Image("alpine:latest", llb.WithMetaResolver(client), llb.Platform(*p)).
+			worker = llb.Image("alpine:latest", imgOpts...).
 				Run(llb.Shlex("apk add --no-cache go git ca-certificates patch")).Root()
 		}
 
-		st, err := spec.GomodDeps(sOpt, worker, llb.Platform(*p))
+		st, err := spec.GomodDeps(sOpt, worker)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -59,10 +62,10 @@ func Gomods(ctx context.Context, client gwclient.Client) (*client.Result, error)
 			return nil, nil, err
 		}
 
-		platformStr := platforms.FormatAll(*p)
-		ref, found := res.FindRef(platformStr)
+		ps := dalec.PlatformString(p)
+		ref, found := res.FindRef(ps)
 		if !found {
-			return nil, nil, fmt.Errorf("no ref found for platform: %s", platformStr)
+			return nil, nil, fmt.Errorf("no ref found for platform: %s", ps)
 		}
 
 		return ref, &dalec.DockerImageSpec{

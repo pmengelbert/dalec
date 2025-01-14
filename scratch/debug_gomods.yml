@@ -19,6 +19,12 @@ packager: Microsoft <support@microsoft.com>
 license: Apache 2.0
 
 sources:
+  src:
+    generate:
+      - gomod: {}
+    git:
+      url: https://github.com/moby/buildkit.git
+      commit: v0.18.2
   bin:
     build:
       target: final
