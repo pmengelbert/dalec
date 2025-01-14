@@ -1,0 +1,63 @@
+# syntax=pengelbert.azurecr.io/dalec/frontend:latest
+
+# TODO: The spec is not currently setting the revision in the runc version
+# This should be fixed before this spec is used to build a real package.
+
+args:
+  REVISION: "1"
+  VERSION: 1.1.13
+  RUNC_COMMIT: v1.1.13
+
+name: moby-runc
+description: A CLI tool for spawning and running containers according to the OCI specification.
+website: https://www.runc.io
+version: ${VERSION}
+revision: ${REVISION}
+vendor: Moby
+
+packager: Microsoft <support@microsoft.com>
+license: Apache 2.0
+
+sources:
+  bin:
+    build:
+      target: final
+      source:
+        inline:
+          dir:
+            files:
+              Dockerfile:
+                contents: |
+                  FROM ubuntu:jammy AS build
+                  WORKDIR /src
+                  COPY main.c .
+                  RUN apt-get update && apt-get install -y gcc && gcc -o bin main.c
+
+                  FROM scratch AS final
+                  COPY --from=build /src/bin /bin
+              main.c:
+                contents: |
+                  #include <stdio.h>
+
+                  int main(int argc, char** argv) {
+                    printf("hello\n");
+                    return 123;
+                  }
+build:
+  env:
+    CGO_ENABLED: 1
+    GOGC: off
+    GOFLAGS: -trimpath
+  steps:
+    - command: |
+        cp bin/bin ./hello
+
+artifacts:
+  binaries:
+    hello:
+
+image:
+  post:
+    symlinks:
+      /usr/bin/hello:
+        path: /linky_linky
