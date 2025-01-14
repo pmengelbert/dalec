@@ -2,9 +2,11 @@ package debug
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/Azure/dalec"
 	"github.com/Azure/dalec/frontend"
+	"github.com/containerd/platforms"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/frontend/gateway/client"
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
@@ -26,15 +28,21 @@ func Gomods(ctx context.Context, client gwclient.Client) (*client.Result, error)
 			return nil, nil, err
 		}
 
+		p := platform
+		if p == nil {
+			pp := platforms.DefaultSpec()
+			p = &pp
+		}
+
 		// Allow the client to override the worker image
 		// This is useful for keeping pre-built worker image, especially for CI.
 		worker, ok := inputs[keyGomodWorker]
 		if !ok {
-			worker = llb.Image("alpine:latest", llb.WithMetaResolver(client)).
+			worker = llb.Image("alpine:latest", llb.WithMetaResolver(client), llb.Platform(*p)).
 				Run(llb.Shlex("apk add --no-cache go git ca-certificates patch")).Root()
 		}
 
-		st, err := spec.GomodDeps(sOpt, worker)
+		st, err := spec.GomodDeps(sOpt, worker, llb.Platform(*p))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -51,10 +59,16 @@ func Gomods(ctx context.Context, client gwclient.Client) (*client.Result, error)
 			return nil, nil, err
 		}
 
-		ref, err := res.SingleRef()
-		if err != nil {
-			return nil, nil, err
+		platformStr := platforms.FormatAll(*p)
+		ref, found := res.FindRef(platformStr)
+		if !found {
+			return nil, nil, fmt.Errorf("no ref found for platform: %s", platformStr)
 		}
-		return ref, &dalec.DockerImageSpec{}, nil
+
+		return ref, &dalec.DockerImageSpec{
+			Image: ocispecs.Image{
+				Platform: *platform,
+			},
+		}, nil
 	})
 }

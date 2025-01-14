@@ -11,19 +11,38 @@ if [ -z "$(command -v pgrep)" ]; then
     exit 1
 fi
 
+if [ "$(</proc/sys/kernel/yama/ptrace_scope)" -ne 0 ]; then
+    echo "ptrace_scope must be set to zero for debugging to work. try:"
+    echo "echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope"
+    exit 1
+fi
+
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${PROJECT_DIR}"
 
+frontend_build_invocation=()
+build_invocation=()
+
+for arg in "$@"; do
+    if [[ "${arg}" =~ ^--frontend-.* ]]; then
+        frontend_build_invocation+=("${arg/--frontend-/--}")
+        continue
+    fi
+
+    build_invocation+=("$arg")
+done
+
 # Build frontend with debugging setup Note the host path for the dalec source
 # and the in-container build path must be the same
-REF="local/dalec/frontend:tmp"
-docker build \
+: "${REF:=local/dalec/frontend:tmp}"
+docker buildx build \
     -f Dockerfile.debug \
     -t "${REF}" \
     --build-arg=HOSTDIR="${PROJECT_DIR}" \
+    "${frontend_build_invocation[@]}" \
     .
 
-# Wait for frontend process to start, and forward the socket connection when the process has started
+# Wait for fronten process to start, and forward the socket connection when the process has started
 (
     pid=""
     while [ -z "$pid" ]; do
@@ -38,4 +57,4 @@ docker build \
 ) &
 
 # Run the build
-docker build --build-arg=BUILDKIT_SYNTAX="${REF}" "$@"
+docker buildx build --build-arg=BUILDKIT_SYNTAX="${REF}" "${build_invocation[@]}"

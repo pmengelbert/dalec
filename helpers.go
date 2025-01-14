@@ -569,21 +569,22 @@ func SetBuildNetworkMode(spec *Spec) llb.StateOption {
 func BaseImageConfig(platform *ocispecs.Platform) *DockerImageSpec {
 	img := &DockerImageSpec{}
 
-	if platform == nil {
-		p := platforms.DefaultSpec()
-		platform = &p
+	p := platform
+	if p == nil {
+		pp := platforms.DefaultSpec()
+		p = &pp
 	}
 
-	img.Architecture = platform.Architecture
-	img.OS = platform.OS
-	img.OSVersion = platform.OSVersion
-	if platform.OSFeatures != nil {
-		img.OSFeatures = append([]string{}, platform.OSFeatures...)
+	img.Architecture = p.Architecture
+	img.OS = p.OS
+	img.OSVersion = p.OSVersion
+	if p.OSFeatures != nil {
+		img.OSFeatures = append([]string{}, p.OSFeatures...)
 	}
-	img.Variant = platform.Variant
+	img.Variant = p.Variant
 	img.RootFS.Type = "layers"
 	img.Config.WorkingDir = "/"
-	img.Config.Env = []string{"PATH=" + system.DefaultPathEnv(platform.OS)}
+	img.Config.Env = []string{"PATH=" + system.DefaultPathEnv(p.OS)}
 
 	return img
 }

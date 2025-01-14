@@ -11,6 +11,7 @@ import (
 	"github.com/Azure/dalec/frontend/debug"
 	"github.com/Azure/dalec/frontend/ubuntu"
 	"github.com/Azure/dalec/frontend/windows"
+	"github.com/moby/buildkit/client/llb"
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/frontend/gateway/grpcclient"
 	"github.com/moby/buildkit/util/appcontext"
@@ -35,6 +36,11 @@ func main() {
 
 	f := func(ctx context.Context, client gwclient.Client) (*gwclient.Result, error) {
 		if err := waitForDebug(ctx); err != nil {
+			s := llb.Scratch().File(llb.Mkfile("/error", 0o644, []byte(err.Error())))
+			def, _ := s.Marshal(ctx)
+			client.Solve(ctx, gwclient.SolveRequest{
+				Definition: def.ToPB(),
+			})
 			return nil, err
 		}
 
