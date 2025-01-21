@@ -34,6 +34,7 @@ docker build \
     -f Dockerfile.debug \
     -t "${REF}" \
     --build-arg=HOSTDIR="${PROJECT_DIR}" \
+    --build-context=dlv-cfg=/home/pme/.config/dlv \
     .
 
 # Wait for frontend process to start, and forward the socket connection when the process has started

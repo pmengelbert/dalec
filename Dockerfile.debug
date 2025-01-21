@@ -1,5 +1,6 @@
 FROM --platform=${BUILDPLATFORM} mcr.microsoft.com/oss/go/microsoft/golang:1.22@sha256:9e5243001d0f43d6e1c556a0ce8eedc1bc80eb37b5210036b289d2c601bc08b6 AS go
 FROM scratch AS dlv-ctx
+FROM scratch AS dlv-cfg
 
 FROM go  AS frontend-build
 ARG HOSTDIR
@@ -32,6 +33,7 @@ COPY . ${HOSTDIR}
 COPY --from=frontend-build /frontend /frontend
 COPY --from=frontend-build /dalec-redirectio /dalec-redirectio
 COPY --from=dlv-build /dlv/dlv /usr/local/bin/dlv
+COPY --from=dlv-cfg /config.yml /root/.config/dlv/config.yml
 LABEL moby.buildkit.frontend.network.none="true"
 LABEL moby.buildkit.frontend.caps="moby.buildkit.frontend.inputs,moby.buildkit.frontend.subrequests,moby.buildkit.frontend.contexts"
 ENTRYPOINT ["/frontend"]
