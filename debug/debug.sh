@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -eux
+set -eu
 
 PTRACE_SCOPE_PROCFILE="/proc/sys/kernel/yama/ptrace_scope"
 

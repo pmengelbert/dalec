@@ -41,9 +41,13 @@ func withGomod(g *SourceGenerator, srcSt, worker llb.State, opts ...llb.Constrai
 			paths = []string{"."}
 		}
 
+		// header: GIT_AUTH_HEADER # Default header secret used
+		// token: GIT_AUTH_TOKEN # Default token secret used
+		// ssh: default # Default SSH secret used
 		for _, path := range paths {
 			in = worker.Run(
-				ShArgs("go mod download"),
+				ShArgs(`tkn=$(echo "$GIT_AUTH_HEADER") && git config --global http.https://github.com/.extraheader "Authorization: ${tkn}" && go mod download`),
+				SecretToEnv("GIT_AUTH_HEADER"),
 				llb.AddEnv("GOPATH", "/go"),
 				llb.Dir(filepath.Join(joinedWorkDir, path)),
 				srcMount,
