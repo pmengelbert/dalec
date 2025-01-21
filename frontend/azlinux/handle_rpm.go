@@ -232,6 +232,7 @@ func specToRpmLLB(ctx context.Context, w worker, client gwclient.Client, spec *d
 	}
 	base = base.With(installOpt)
 
+	// dc, _ := dockerui.NewClient(client)
 	br, err := rpm.SpecToBuildrootLLB(base, spec, sOpt, targetKey, opts...)
 	if err != nil {
 		return llb.Scratch(), err
