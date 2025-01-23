@@ -16,15 +16,6 @@ import (
 	"github.com/opencontainers/go-digest"
 )
 
-//go:embed _main.go
-var privateGomodFixtureMain string
-
-//go:embed _go.mod
-var privateGomodFixtureGoMod string
-
-//go:embed _go.sum
-var privateGomodFixtureGoSum string
-
 func TestSourceCmd(t *testing.T) {
 	t.Parallel()
 
