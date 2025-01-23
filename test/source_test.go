@@ -611,6 +611,112 @@ index ea874f5..ba38f84 100644
 	})
 }
 
+func TestSourceWithPrivateGomod(t *testing.T) {
+	t.Parallel()
+
+	// Note: module here should be moduyle+version because this is checking the go module path on disk
+	checkGitConfig := func(ctx context.Context, gwc gwclient.Client, spec *dalec.Spec) {
+		const gitconfigPath = "/root/.gitconfig"
+		t.Helper()
+
+		res, err := gwc.Solve(ctx, newSolveRequest(withBuildTarget("debug/gomods"), withSpec(ctx, t, spec)))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ref, err := res.SingleRef()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		stat, err := ref.StatFile(ctx, gwclient.StatRequest{
+			Path: gitconfigPath,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !fs.FileMode(stat.Mode).IsDir() {
+			t.Fatal("expected directory")
+		}
+	}
+
+	const srcName = "src1"
+
+	const gitAuthTokenKey = "GIT_AUTH_TOKEN"
+	const gitAuthHeaderKey = "GIT_AUTH_HEADER"
+	// token := os.Getenv(gitAuthTokenKey)
+	// header := os.Getenv(gitAuthHeaderKey)
+
+	baseSpec := func() *dalec.Spec {
+		return &dalec.Spec{
+			Sources: map[string]dalec.Source{
+				srcName: {
+					Generate: []*dalec.SourceGenerator{
+						{
+							Gomod: &dalec.GeneratorGomod{
+								Auth: nil,
+							},
+						},
+					},
+					Inline: &dalec.SourceInline{
+						Dir: &dalec.SourceInlineDir{
+							Files: map[string]*dalec.SourceInlineFile{
+								"main.go": {Contents: privateGomodFixtureMain},
+								"go.mod":  {Contents: privateGomodFixtureGoMod},
+								"go.sum":  {Contents: privateGomodFixtureGoSum},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	const token = "a6IidAKtHmmvsqQmFA2oOcwLEbqATnzUnBNJmtwI"
+	const expectedFromToken = "Authorization: basic eC1hY2Nlc3MtdG9rZW46YTZJaWRBS3RIbW12c3FRbUZBMm9PY3dMRWJxQVRuelVuQk5KbXR3SQ=="
+	withToken := func(s *dalec.Spec) {
+		src := s.Sources[srcName]
+		src.Generate[0].Gomod.Auth = map[string]dalec.GitAuth{
+			"github.com": {
+				Token: gitAuthTokenKey,
+			},
+		}
+		s.Sources[srcName] = src
+	}
+
+	const header = "basic eC1hY2Nlc3MtdG9rZW46M0pPTHRsMXRRRktiVkNWVU45alN3WHVucmMwWlp6UEtlVWxSN2hUYQ=="
+	const expectedFromHeader = "Authorization: basic eC1hY2Nlc3MtdG9rZW46M0pPTHRsMXRRRktiVkNWVU45alN3WHVucmMwWlp6UEtlVWxSN2hUYQ=="
+	withHeader := func(s *dalec.Spec) {
+		src := s.Sources[srcName]
+		src.Generate[0].Gomod.Auth = map[string]dalec.GitAuth{
+			"github.com": {
+				Header: gitAuthHeaderKey,
+			},
+		}
+		s.Sources[srcName] = src
+	}
+
+	t.Run("with git auth token", func(t *testing.T) {
+		t.Parallel()
+		spec := baseSpec()
+		withToken(spec)
+
+		testEnv.RunTest(baseCtx, t, func(ctx context.Context, gwc gwclient.Client) {
+			checkGitConfig(ctx, gwc, "github.com/!azure/osm@v1.2.10", spec)
+		})
+	})
+
+	t.Run("with git auth header", func(t *testing.T) {
+		t.Parallel()
+		spec := baseSpec()
+		withHeader(spec)
+		testEnv.RunTest(baseCtx, t, func(ctx context.Context, gwc gwclient.Client) {
+			checkGitConfig(ctx, gwc, "github.com/!azure/osm@v1.2.10", spec)
+		})
+	})
+}
+
 func TestSourceContext(t *testing.T) {
 	t.Parallel()
 
