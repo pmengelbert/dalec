@@ -108,8 +108,9 @@ func SourceOptFromClient(ctx context.Context, c gwclient.Client) (dalec.SourceOp
 	}
 
 	return dalec.SourceOpts{
-		Resolver: c,
-		Forward:  ForwarderFromClient(ctx, c),
+		SessionID: c.BuildOpts().SessionID,
+		Resolver:  c,
+		Forward:   ForwarderFromClient(ctx, c),
 		GetContext: func(ref string, opts ...llb.LocalOption) (*llb.State, error) {
 			if ref == dockerui.DefaultLocalNameContext {
 				return dc.MainContext(ctx, opts...)
