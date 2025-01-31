@@ -1,0 +1,1 @@
+Make test to ensure auto-propagating secrets don't overwrite manually supplied secrets.
