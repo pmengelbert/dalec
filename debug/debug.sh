@@ -38,32 +38,21 @@ docker build \
     .
 
 # Wait for frontend process to start, and forward the socket connection when the process has started
-(
+coproc SET_UP_SOCAT {
     set +ex
-    pid=""
-    while [ -z "$pid" ]; do
-        sleep 0.5
-        pid="$(pgrep frontend)"
-    done
+    coproc FRONTEND_WAIT {
+        pid=""
+        while [ -z "$pid" ]; do
+            sleep 0.5
+            pid="$(pgrep frontend)"
+        done
+        echo "$pid"
+    }
+    eval pid="$(cat <&${FRONTEND_WAIT[0]})"
 
     socat_logfile="$(mktemp /tmp/dalec.socat.XXXXXXX)"
-    socat -v UNIX:"/proc/${pid}/root/dlv.sock" TCP-LISTEN:30157,reuseaddr,fork 2>"$socat_logfile" 1>/dev/null &
-    socat_pid="$!"
-
-    killsocat_inner() {
-        kill -9 "${socat_pid}" >/dev/null 2>&1
-    }
-
-    trap killsocat_inner EXIT
-    wait "${socat_pid}"
-) &
-
-killsocat() {
-    set +exu
-    pgrep -f 'socat.*dlv.sock.*TCP-LISTEN:30157,reuseaddr,fork' | xargs kill -9
+    socat -v UNIX:"/proc/${pid}/root/dlv.sock" TCP-LISTEN:30157,reuseaddr,fork 2>"$socat_logfile" 1>/dev/null
 }
 
-trap killsocat EXIT
-
 # Run the build
-docker build --build-arg=BUILDKIT_SYNTAX="${REF}" "$@"
+exec docker build --build-arg=BUILDKIT_SYNTAX="${REF}" "$@"
