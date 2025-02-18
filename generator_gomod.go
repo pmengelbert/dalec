@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/goccy/go-yaml"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/pkg/errors"
 )
@@ -41,6 +42,8 @@ func withGomod(g *SourceGenerator, srcSt, worker llb.State, opts ...llb.Constrai
 			workDir                      = "/work/src"
 			scriptMountpoint             = "/tmp/dalec/internal/gomod"
 			gomodDownloadWrapperBasename = "go_mod_download.sh"
+			authConfigMountPath          = "/tmp/dalec/internal/git_auth_config"
+			authConfigBasename           = "authconfig.yml"
 		)
 
 		joinedWorkDir := filepath.Join(workDir, g.Subpath)
@@ -52,7 +55,7 @@ func withGomod(g *SourceGenerator, srcSt, worker llb.State, opts ...llb.Constrai
 		}
 
 		sort.Strings(paths)
-		script := g.gitconfigGeneratorScript(gomodDownloadWrapperBasename)
+		script := g.gitconfigGeneratorScript(gomodDownloadWrapperBasename, "")
 		scriptPath := filepath.Join(scriptMountpoint, gomodDownloadWrapperBasename)
 
 		for _, path := range paths {
@@ -71,7 +74,23 @@ func withGomod(g *SourceGenerator, srcSt, worker llb.State, opts ...llb.Constrai
 	}
 }
 
-func (g *SourceGenerator) gitconfigGeneratorScript(scriptPath string) llb.State {
+func (g *SourceGenerator) mountGitAuthConfig(mountPoint, basename string) llb.RunOption {
+	return RunOptFunc(func(ei *llb.ExecInfo) {
+		if g.Gomod == nil || g.Gomod.Auth == nil {
+			return
+		}
+
+		b, err := yaml.Marshal(&g.Gomod.Auth)
+		if err != nil {
+			panic("cannot marshal dalec spec yaml")
+		}
+
+		st := llb.Scratch().File(llb.Mkfile("/"+basename, 0o644, b))
+		llb.AddMount(mountPoint, st).SetRunOption(ei)
+	})
+}
+
+func (g *SourceGenerator) gitconfigGeneratorScript(scriptPath, configPath string) llb.State {
 	var (
 		script bytes.Buffer
 		noop   = func() {}
@@ -85,38 +104,14 @@ func (g *SourceGenerator) gitconfigGeneratorScript(scriptPath string) llb.State 
 
 	fmt.Fprintln(&script, `#!/usr/bin/env sh`)
 
-	for host, auth := range g.Gomod.Auth {
+	sortedHosts := SortMapKeys(g.Gomod.Auth)
+
+	for _, host := range sortedHosts {
 		// Only do this the first time through the loop
 		createPreamble()
 		createPreamble = noop
 
-		var headerArg string
-		if auth.Header != "" {
-			headerArg = fmt.Sprintf(`Authorization: ${%s}`, auth.Header)
-		}
-
-		if auth.Token != "" && headerArg == "" {
-			line := fmt.Sprintf(`tkn="$(echo -n "x-access-token:${%s}" | base64)"`, auth.Token)
-			fmt.Fprintln(&script, line)
-
-			headerArg = `Authorization: basic ${tkn}`
-		}
-
-		if headerArg != "" {
-			fmt.Fprintf(&script, `git config --global http."https://%s".extraheader "%s"`, host, headerArg)
-			script.WriteRune('\n')
-			continue
-		}
-
-		username := "git"
-		if auth.SSH != nil {
-			if auth.SSH.Username != "" {
-				username = auth.SSH.Username
-			}
-
-			fmt.Fprintf(&script, `git config --global "url.ssh://%[1]s@%[2]s/.insteadOf" https://%[2]s/`, username, host)
-			script.WriteRune('\n')
-		}
+		fmt.Fprintf(&script, "git config --global credential.\"https://%s\".helper dalec %s", host, configPath)
 	}
 
 	fmt.Fprintln(&script, "go mod download")
@@ -161,7 +156,7 @@ func (g *SourceGenerator) withGomodSecretsAndSockets() llb.RunOption {
 		}
 
 		for secret := range secrets {
-			secretToEnv(secret).SetRunOption(ei)
+			llb.AddSecret(secret).SetRunOption(ei)
 		}
 	})
 }
