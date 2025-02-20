@@ -13,6 +13,10 @@ import (
 
 const keyGomodWorker = "context:gomod-worker"
 
+type frontendClient interface {
+	CurrentFrontend() (*llb.State, error)
+}
+
 // Gomods outputs all the gomodule dependencies for the spec
 func Gomods(ctx context.Context, client gwclient.Client) (*client.Result, error) {
 	return frontend.BuildWithPlatform(ctx, client, func(ctx context.Context, client gwclient.Client, platform *ocispecs.Platform, spec *dalec.Spec, targetKey string) (gwclient.Reference, *dalec.DockerImageSpec, error) {
@@ -34,7 +38,12 @@ func Gomods(ctx context.Context, client gwclient.Client) (*client.Result, error)
 				Run(llb.Shlex("apk add --no-cache go git ca-certificates patch openssh")).Root()
 		}
 
-		st, err := spec.GomodDeps(sOpt, worker)
+		fst, err := client.(frontendClient).CurrentFrontend()
+		if err != nil {
+			return nil, nil, err
+		}
+
+		st, err := spec.GomodDeps2(sOpt, worker, *fst)
 		if err != nil {
 			return nil, nil, err
 		}

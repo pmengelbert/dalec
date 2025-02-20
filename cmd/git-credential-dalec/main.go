@@ -33,9 +33,9 @@ type gitPayload struct {
 	credential        string   `gitCredential:"credential"`
 	ephemeral         string   `gitCredential:"ephemeral"`
 	kontinue          string   `gitCredential:"continue"`
-	wwwauth           []string `gitCredential:"wwwauth"`
-	capability        []string `gitCredential:"capability"`
-	state             []string `gitCredential:"state"`
+	wwwauth           []string `gitCredential:"wwwauth[]"`
+	capability        []string `gitCredential:"capability[]"`
+	state             []string `gitCredential:"state[]"`
 }
 
 func exit(msg string, code int) {
@@ -55,23 +55,29 @@ func main() {
 	var err error
 
 	if len(os.Args) < 3 {
-		exit1("an action and config file are required")
+		msg := fmt.Sprintf("%#v\n", os.Args)
+		exit1("an action and config file are required: " + msg)
 	}
 
 	configFile := os.Args[1]
 	action := os.Args[2]
 
+	payload := readPayload(os.Stdin)
+
 	switch action {
 	case "get":
 	case "store", "erase":
-		exit1("cannot store")
+		// send the "continue" signal to git, signifying that we can't satisfy
+		// the request.
+		sendContinue(&payload)
+		os.Exit(0)
 	default:
 		exit1(fmt.Sprintf("unrecognized action: %q", action))
 	}
 
-	payload := readPayload(os.Stdin)
 	if payload.protocol != "http" && payload.protocol != "https" {
-		exit1("this helper only supports http(s)")
+		sendContinue(&payload)
+		os.Exit(1)
 	}
 
 	auth, err := getHostAuthFromConfigFile(configFile, payload.host)
@@ -87,15 +93,25 @@ func main() {
 	case auth.Token != "":
 		resp, err = generateResponse(&payload, auth.Token, authTypeToken)
 	case auth.Header != "":
-		resp, err = generateResponse(&payload, auth.Header, authTypeToken)
+		resp, err = generateResponse(&payload, auth.Header, authTypeHeader)
 	default:
-		exit1(fmt.Sprintf("either token or header must be provided for host %q", payload.host))
+		sendContinue(&payload)
+		os.Exit(0)
 	}
 
 	if err != nil {
 		exit1(err.Error())
 	}
 
+	fmt.Println(resp)
+}
+
+func sendContinue(payload *gitPayload) {
+	payload.kontinue = "true"
+	resp, err := printPayload(payload)
+	if err != nil {
+		exit1(err.Error())
+	}
 	fmt.Println(resp)
 }
 
@@ -194,7 +210,7 @@ func getHostAuthFromConfigFile(configFile, hostname string) (*dalec.GomodGitAuth
 		return nil, err
 	}
 
-	if err := yaml.Unmarshal(b, m); err != nil {
+	if err := yaml.Unmarshal(b, &m); err != nil {
 		return nil, err
 	}
 
@@ -225,15 +241,9 @@ func generateResponse(payload *gitPayload, secret string, authType int) (string,
 
 func handleSecretHeader(b []byte, payload *gitPayload) (string, error) {
 	s := string(b)
-	_, hdr, ok := strings.Cut(s, "Authorization: ")
-	badAuthHeader := fmt.Errorf("improperly formatted auth header")
+	authtype, credential, ok := strings.Cut(s, " ")
 	if !ok {
-		return "", badAuthHeader
-	}
-
-	authtype, credential, ok := strings.Cut(hdr, " ")
-	if !ok {
-		return "", badAuthHeader
+		return "", fmt.Errorf("improperly formatted auth header")
 	}
 
 	payload.authtype = authtype
@@ -253,7 +263,7 @@ func handleSecretToken(b []byte, payload *gitPayload) (string, error) {
 	}
 
 	payload.authtype = "basic"
-	payload.credential = base64.RawStdEncoding.EncodeToString(buf.Bytes())
+	payload.credential = base64.StdEncoding.EncodeToString(buf.Bytes())
 
 	return printPayload(payload)
 }
