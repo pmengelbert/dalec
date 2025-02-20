@@ -26,7 +26,7 @@ func HandleSources(wf WorkerFunc) gwclient.BuildFunc {
 				return nil, nil, err
 			}
 
-			sources, err := Dalec2SourcesLLB(worker, spec, sOpt)
+			sources, err := Dalec2SourcesLLB(client, worker, spec, sOpt)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -102,7 +102,7 @@ func buildScript(spec *dalec.Spec) string {
 	return b.String()
 }
 
-func Dalec2SourcesLLB(worker llb.State, spec *dalec.Spec, sOpt dalec.SourceOpts, opts ...llb.ConstraintsOpt) ([]llb.State, error) {
+func Dalec2SourcesLLB(client gwclient.Client, worker llb.State, spec *dalec.Spec, sOpt dalec.SourceOpts, opts ...llb.ConstraintsOpt) ([]llb.State, error) {
 	sources, err := dalec.Sources(spec, sOpt)
 	if err != nil {
 		return nil, err
@@ -113,7 +113,12 @@ func Dalec2SourcesLLB(worker llb.State, spec *dalec.Spec, sOpt dalec.SourceOpts,
 		return append(opts, dalec.ProgressGroup(s))
 	}
 
-	st, err := spec.GomodDeps(sOpt, worker, withPG("Add gomod sources")...)
+	credHelper, err := frontend.GetGomodCredHelper(client)
+	if err != nil {
+		return nil, err
+	}
+
+	st, err := spec.GomodDeps(sOpt, worker, credHelper, withPG("Add gomod sources")...)
 	if err != nil {
 		return nil, errors.Wrap(err, "error adding gomod sources")
 	}

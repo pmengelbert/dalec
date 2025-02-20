@@ -21,6 +21,10 @@ type LoadConfig struct {
 
 type LoadOpt func(*LoadConfig)
 
+type frontendClient interface {
+	CurrentFrontend() (*llb.State, error)
+}
+
 func WithAllowArgs(args ...string) LoadOpt {
 	return func(cfg *LoadConfig) {
 		set := make(map[string]struct{}, len(args))
@@ -153,4 +157,26 @@ func GetBaseImage(sOpt dalec.SourceOpts, ref string) llb.State {
 		}
 		return llb.Image(ref, llb.WithMetaResolver(sOpt.Resolver), dalec.WithConstraint(c)), nil
 	})
+}
+
+func GetCurrentFrontend(client gwclient.Client) (llb.State, error) {
+	f, err := client.(frontendClient).CurrentFrontend()
+	if err != nil {
+		return llb.Scratch(), err
+	}
+
+	if f == nil {
+		return llb.Scratch(), fmt.Errorf("nil frontend state returned")
+	}
+
+	return *f, nil
+}
+
+func GetGomodCredHelper(client gwclient.Client) (llb.State, error) {
+	f, err := GetCurrentFrontend(client)
+	if err != nil {
+		return llb.Scratch(), err
+	}
+
+	return llb.Scratch().File(llb.Copy(f, "/usr/bin/git-credential-dalec", "/git-credential-dalec")), nil
 }

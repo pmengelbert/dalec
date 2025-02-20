@@ -35,45 +35,7 @@ func (s *Spec) HasGomods() bool {
 	return false
 }
 
-func withGomod(g *SourceGenerator, srcSt, worker llb.State, opts ...llb.ConstraintsOpt) func(llb.State) llb.State {
-	return func(in llb.State) llb.State {
-		const (
-			fourKB                       = 4096
-			workDir                      = "/work/src"
-			scriptMountpoint             = "/tmp/dalec/internal/gomod"
-			gomodDownloadWrapperBasename = "go_mod_download.sh"
-			authConfigMountPath          = "/tmp/dalec/internal/git_auth_config"
-			authConfigBasename           = "authconfig.yml"
-		)
-
-		joinedWorkDir := filepath.Join(workDir, g.Subpath)
-		srcMount := llb.AddMount(workDir, srcSt)
-
-		paths := g.Gomod.Paths
-		if g.Gomod.Paths == nil {
-			paths = []string{"."}
-		}
-
-		sort.Strings(paths)
-		script := g.gitconfigGeneratorScript(gomodDownloadWrapperBasename, "", "")
-		scriptPath := filepath.Join(scriptMountpoint, gomodDownloadWrapperBasename)
-
-		for _, path := range paths {
-			in = worker.Run(
-				ShArgs(scriptPath),
-				llb.AddEnv("GOPATH", "/go"),
-				g.withGomodSecretsAndSockets(),
-				llb.AddMount(scriptMountpoint, script),
-				llb.Dir(filepath.Join(joinedWorkDir, path)),
-				srcMount,
-				WithConstraints(opts...),
-			).AddMount(gomodCacheDir, in)
-		}
-		return in
-	}
-}
-
-func withGomod2(g *SourceGenerator, srcSt, worker, credHelper llb.State, opts ...llb.ConstraintsOpt) func(llb.State) llb.State {
+func withGomod(g *SourceGenerator, srcSt, worker, credHelper llb.State, opts ...llb.ConstraintsOpt) func(llb.State) llb.State {
 	return func(in llb.State) llb.State {
 		const (
 			fourKB                       = 4096
@@ -101,7 +63,7 @@ func withGomod2(g *SourceGenerator, srcSt, worker, credHelper llb.State, opts ..
 		for _, path := range paths {
 			in = worker.Run(
 				ShArgs(scriptPath),
-				llb.AddMount(credHelperBinPath, credHelper, llb.SourcePath("/usr/bin/git-credential-dalec")),
+				llb.AddMount(credHelperBinPath, credHelper, llb.SourcePath("/git-credential-dalec")),
 				llb.AddEnv("GOPATH", "/go"),
 				g.withGomodSecretsAndSockets(),
 				g.mountGitAuthConfig(authConfigMountPath, authConfigBasename),
@@ -216,7 +178,7 @@ func (s *Spec) gomodSources() map[string]Source {
 // GomodDeps returns an [llb.State] containing all the go module dependencies for the spec
 // for any sources that have a gomod generator specified.
 // If there are no sources with a gomod generator, this will return a nil state.
-func (s *Spec) GomodDeps(sOpt SourceOpts, worker llb.State, opts ...llb.ConstraintsOpt) (*llb.State, error) {
+func (s *Spec) GomodDeps(sOpt SourceOpts, worker, credHelper llb.State, opts ...llb.ConstraintsOpt) (*llb.State, error) {
 	sources := s.gomodSources()
 	if len(sources) == 0 {
 		return nil, nil
@@ -242,42 +204,7 @@ func (s *Spec) GomodDeps(sOpt SourceOpts, worker llb.State, opts ...llb.Constrai
 		opts := append(opts, ProgressGroup("Fetch go module dependencies for source: "+key))
 		deps = deps.With(func(in llb.State) llb.State {
 			for _, gen := range src.Generate {
-				in = in.With(withGomod(gen, patched[key], worker, opts...))
-			}
-			return in
-		})
-	}
-
-	return &deps, nil
-}
-
-func (s *Spec) GomodDeps2(sOpt SourceOpts, worker, credHelper llb.State, opts ...llb.ConstraintsOpt) (*llb.State, error) {
-	sources := s.gomodSources()
-	if len(sources) == 0 {
-		return nil, nil
-	}
-
-	deps := llb.Scratch()
-
-	// Get the patched sources for the go modules
-	// This is needed in case a patch includes changes to go.mod or go.sum
-	patched, err := s.getPatchedSources(sOpt, worker, func(name string) bool {
-		_, ok := sources[name]
-		return ok
-	}, opts...)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get patched sources")
-	}
-
-	sorted := SortMapKeys(patched)
-
-	for _, key := range sorted {
-		src := s.Sources[key]
-
-		opts := append(opts, ProgressGroup("Fetch go module dependencies for source: "+key))
-		deps = deps.With(func(in llb.State) llb.State {
-			for _, gen := range src.Generate {
-				in = in.With(withGomod2(gen, patched[key], worker, credHelper, opts...))
+				in = in.With(withGomod(gen, patched[key], worker, credHelper, opts...))
 			}
 			return in
 		})

@@ -26,7 +26,7 @@ func HandleBuildroot(wf WorkerFunc) gwclient.BuildFunc {
 				return nil, nil, err
 			}
 
-			st, err := SpecToBuildrootLLB(worker, spec, sOpt, targetKey)
+			st, err := SpecToBuildrootLLB(client, worker, spec, sOpt, targetKey)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -54,13 +54,13 @@ func HandleBuildroot(wf WorkerFunc) gwclient.BuildFunc {
 }
 
 // SpecToBuildrootLLB converts a dalec.Spec to an rpm buildroot
-func SpecToBuildrootLLB(worker llb.State, spec *dalec.Spec, sOpt dalec.SourceOpts, targetKey string, opts ...llb.ConstraintsOpt) (llb.State, error) {
+func SpecToBuildrootLLB(client gwclient.Client, worker llb.State, spec *dalec.Spec, sOpt dalec.SourceOpts, targetKey string, opts ...llb.ConstraintsOpt) (llb.State, error) {
 	if err := ValidateSpec(spec); err != nil {
 		return llb.Scratch(), fmt.Errorf("invalid spec: %w", err)
 	}
 	opts = append(opts, dalec.ProgressGroup("Create RPM buildroot"))
 
-	sources, err := Dalec2SourcesLLB(worker, spec, sOpt, opts...)
+	sources, err := Dalec2SourcesLLB(client, worker, spec, sOpt, opts...)
 	if err != nil {
 		return llb.Scratch(), err
 	}

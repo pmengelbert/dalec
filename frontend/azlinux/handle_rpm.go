@@ -232,7 +232,7 @@ func specToRpmLLB(ctx context.Context, w worker, client gwclient.Client, spec *d
 	}
 	base = base.With(installOpt)
 
-	br, err := rpm.SpecToBuildrootLLB(base, spec, sOpt, targetKey, opts...)
+	br, err := rpm.SpecToBuildrootLLB(client, base, spec, sOpt, targetKey, opts...)
 	if err != nil {
 		return llb.Scratch(), err
 	}
