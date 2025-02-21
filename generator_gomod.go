@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/Azure/dalec"
 	"github.com/goccy/go-yaml"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/pkg/errors"
@@ -44,7 +45,7 @@ func withGomod(g *SourceGenerator, srcSt, worker, credHelper llb.State, opts ...
 			gomodDownloadWrapperBasename = "go_mod_download.sh"
 			authConfigMountPath          = "/tmp/dalec/internal/git_auth_config"
 			authConfigBasename           = "authconfig.yml"
-			credHelperBinPath            = "/tmp/dalec/internal/git/git-credential-dalec"
+			credHelperBaseDir            = "/usr/local/bin"
 		)
 
 		joinedWorkDir := filepath.Join(workDir, g.Subpath)
@@ -57,14 +58,15 @@ func withGomod(g *SourceGenerator, srcSt, worker, credHelper llb.State, opts ...
 
 		sort.Strings(paths)
 		authConfigPath := filepath.Join(authConfigMountPath, authConfigBasename)
-		script := g.gitconfigGeneratorScript(gomodDownloadWrapperBasename, authConfigPath, credHelperBinPath)
+		script := g.gitconfigGeneratorScript(gomodDownloadWrapperBasename, authConfigPath)
 		scriptPath := filepath.Join(scriptMountpoint, gomodDownloadWrapperBasename)
+		credHelperPath := filepath.Join(credHelperBaseDir, dalec.GitCredentialHelperGomod)
 
 		for _, path := range paths {
 			in = worker.Run(
 				ShArgs(scriptPath),
-				llb.AddMount(credHelperBinPath, credHelper, llb.SourcePath("/git-credential-dalec")),
 				llb.AddEnv("GOPATH", "/go"),
+				llb.AddMount(credHelperPath, credHelper, llb.SourcePath("/"+dalec.GitCredentialHelperGomod)),
 				g.withGomodSecretsAndSockets(),
 				g.mountGitAuthConfig(authConfigMountPath, authConfigBasename),
 				llb.AddMount(scriptMountpoint, script),
@@ -94,7 +96,7 @@ func (g *SourceGenerator) mountGitAuthConfig(mountPoint, basename string) llb.Ru
 	})
 }
 
-func (g *SourceGenerator) gitconfigGeneratorScript(scriptPath, configPath, credHelperBinPath string) llb.State {
+func (g *SourceGenerator) gitconfigGeneratorScript(scriptPath, configPath string) llb.State {
 	var (
 		script bytes.Buffer
 		noop   = func() {}
@@ -114,7 +116,7 @@ func (g *SourceGenerator) gitconfigGeneratorScript(scriptPath, configPath, credH
 		createPreamble()
 		createPreamble = noop
 
-		fmt.Fprintf(&script, `git config --global credential."https://%s".helper "%s %s"`, host, credHelperBinPath, configPath)
+		fmt.Fprintf(&script, `git config --global credential."https://%s".helper "dalec %s"`, host, configPath)
 		script.WriteRune('\n')
 	}
 
@@ -178,7 +180,7 @@ func (s *Spec) gomodSources() map[string]Source {
 // GomodDeps returns an [llb.State] containing all the go module dependencies for the spec
 // for any sources that have a gomod generator specified.
 // If there are no sources with a gomod generator, this will return a nil state.
-func (s *Spec) GomodDeps(sOpt SourceOpts, worker, credHelper llb.State, opts ...llb.ConstraintsOpt) (*llb.State, error) {
+func (s *Spec) GomodDeps(sOpt SourceOpts, worker llb.State, opts ...llb.ConstraintsOpt) (*llb.State, error) {
 	sources := s.gomodSources()
 	if len(sources) == 0 {
 		return nil, nil
@@ -197,6 +199,11 @@ func (s *Spec) GomodDeps(sOpt SourceOpts, worker, credHelper llb.State, opts ...
 	}
 
 	sorted := SortMapKeys(patched)
+
+	credHelper, err := sOpt.GitCredentialHelpers[dalec.GitCredentialHelperGomod]()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get git credential helper")
+	}
 
 	for _, key := range sorted {
 		src := s.Sources[key]

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/Azure/dalec"
@@ -172,11 +173,12 @@ func GetCurrentFrontend(client gwclient.Client) (llb.State, error) {
 	return *f, nil
 }
 
-func GetGomodCredHelper(client gwclient.Client) (llb.State, error) {
+func GetGitCredHelper(client gwclient.Client) (llb.State, error) {
 	f, err := GetCurrentFrontend(client)
 	if err != nil {
 		return llb.Scratch(), err
 	}
 
-	return llb.Scratch().File(llb.Copy(f, "/usr/bin/git-credential-dalec", "/git-credential-dalec")), nil
+	srcPath := filepath.Join(dalec.GitCredentialHelperGomodSrcDir, dalec.GitCredentialHelperGomod)
+	return llb.Scratch().File(llb.Copy(f, srcPath, "/"+dalec.GitCredentialHelperGomod)), nil
 }
