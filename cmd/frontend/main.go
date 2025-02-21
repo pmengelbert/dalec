@@ -4,6 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"os"
+	"strings"
 
 	"github.com/Azure/dalec/frontend"
 	"github.com/Azure/dalec/frontend/azlinux"
@@ -21,9 +22,23 @@ import (
 
 const (
 	Package = "github.com/Azure/dalec/cmd/frontend"
+
+	frontendPath = "/frontend"
 )
 
 func main() {
+	cmd := os.Args[0]
+
+	// each "sub-main" function handles its own exit
+	switch {
+	case strings.HasSuffix(cmd, "git-credential-gomod"):
+		gomodMain()
+	default:
+		dalecMain()
+	}
+}
+
+func dalecMain() {
 	bklog.L.Logger.SetOutput(os.Stderr)
 	grpclog.SetLoggerV2(grpclog.NewLoggerV2WithVerbosity(bklog.L.WriterLevel(logrus.InfoLevel), bklog.L.WriterLevel(logrus.WarnLevel), bklog.L.WriterLevel(logrus.ErrorLevel), 1))
 
@@ -55,5 +70,4 @@ func main() {
 		bklog.L.WithError(err).Fatal("error running frontend")
 		os.Exit(137)
 	}
-
 }

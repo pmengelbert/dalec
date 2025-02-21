@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/Azure/dalec"
 	"github.com/goccy/go-yaml"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/pkg/errors"
@@ -60,13 +59,13 @@ func withGomod(g *SourceGenerator, srcSt, worker, credHelper llb.State, opts ...
 		authConfigPath := filepath.Join(authConfigMountPath, authConfigBasename)
 		script := g.gitconfigGeneratorScript(gomodDownloadWrapperBasename, authConfigPath)
 		scriptPath := filepath.Join(scriptMountpoint, gomodDownloadWrapperBasename)
-		credHelperPath := filepath.Join(credHelperBaseDir, dalec.GitCredentialHelperGomod)
+		credHelperPath := filepath.Join(credHelperBaseDir, GitCredentialHelperGomod)
 
 		for _, path := range paths {
 			in = worker.Run(
 				ShArgs(scriptPath),
 				llb.AddEnv("GOPATH", "/go"),
-				llb.AddMount(credHelperPath, credHelper, llb.SourcePath("/"+dalec.GitCredentialHelperGomod)),
+				withCredHelper(credHelper, credHelperPath),
 				g.withGomodSecretsAndSockets(),
 				g.mountGitAuthConfig(authConfigMountPath, authConfigBasename),
 				llb.AddMount(scriptMountpoint, script),
@@ -77,6 +76,12 @@ func withGomod(g *SourceGenerator, srcSt, worker, credHelper llb.State, opts ...
 			).AddMount(gomodCacheDir, in)
 		}
 		return in
+	}
+}
+
+func withCredHelper(credHelper llb.State, credHelperPath string) RunOptFunc {
+	return func(ei *llb.ExecInfo) {
+		llb.AddMount(credHelperPath, credHelper, llb.SourcePath(GitCredentialHelperGomod)).SetRunOption(ei)
 	}
 }
 
@@ -97,26 +102,15 @@ func (g *SourceGenerator) mountGitAuthConfig(mountPoint, basename string) llb.Ru
 }
 
 func (g *SourceGenerator) gitconfigGeneratorScript(scriptPath, configPath string) llb.State {
-	var (
-		script bytes.Buffer
-		noop   = func() {}
-
-		createPreamble = func() {
-			fmt.Fprintln(&script, `set -eu`)
-			script.WriteRune('\n')
-		}
-	)
-
-	fmt.Fprintln(&script, `#!/usr/bin/env sh`)
+	var script bytes.Buffer
 
 	sortedHosts := SortMapKeys(g.Gomod.Auth)
+	if len(sortedHosts) > 0 {
+		fmt.Fprintln(&script, `set -eu`)
+	}
 
 	for _, host := range sortedHosts {
-		// Only do this the first time through the loop
-		createPreamble()
-		createPreamble = noop
-
-		fmt.Fprintf(&script, `git config --global credential."https://%s".helper "dalec %s"`, host, configPath)
+		fmt.Fprintf(&script, `git config --global credential."https://%s".helper "gomod %s"`, host, configPath)
 		script.WriteRune('\n')
 	}
 
@@ -200,7 +194,7 @@ func (s *Spec) GomodDeps(sOpt SourceOpts, worker llb.State, opts ...llb.Constrai
 
 	sorted := SortMapKeys(patched)
 
-	credHelper, err := sOpt.GitCredentialHelpers[dalec.GitCredentialHelperGomod]()
+	credHelper, err := sOpt.GitCredentialHelpers[GitCredentialHelperGomod]()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get git credential helper")
 	}

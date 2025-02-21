@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/Azure/dalec"
-	"github.com/Azure/dalec/frontend"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/pkg/errors"
 )
@@ -86,12 +85,7 @@ func SourcePackage(ctx context.Context, sOpt dalec.SourceOpts, worker llb.State,
 		return llb.Scratch(), err
 	}
 
-	credHelper, err := frontend.GetGomodCredHelper(client)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	gomodSt, err := spec.GomodDeps(sOpt, worker, credHelper, opts...)
+	gomodSt, err := spec.GomodDeps(sOpt, worker, opts...)
 	if err != nil {
 		return llb.Scratch(), errors.Wrap(err, "error preparing gomod deps")
 	}

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"path/filepath"
 	"time"
 
 	"github.com/Azure/dalec"
@@ -174,11 +173,11 @@ func GetCurrentFrontend(client gwclient.Client) (llb.State, error) {
 }
 
 func GetGitCredHelper(client gwclient.Client) (llb.State, error) {
+	const srcPath = "/frontend"
 	f, err := GetCurrentFrontend(client)
 	if err != nil {
 		return llb.Scratch(), err
 	}
 
-	srcPath := filepath.Join(dalec.GitCredentialHelperGomodSrcDir, dalec.GitCredentialHelperGomod)
-	return llb.Scratch().File(llb.Copy(f, srcPath, "/"+dalec.GitCredentialHelperGomod)), nil
+	return llb.Scratch().File(llb.Copy(f, srcPath, dalec.GitCredentialHelperGomod)), nil
 }

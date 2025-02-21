@@ -34,12 +34,7 @@ func Gomods(ctx context.Context, client gwclient.Client) (*client.Result, error)
 				Run(llb.Shlex("apk add --no-cache go git ca-certificates patch openssh")).Root()
 		}
 
-		credHelper, err := frontend.GetGomodCredHelper(client)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		st, err := spec.GomodDeps(sOpt, worker, credHelper)
+		st, err := spec.GomodDeps(sOpt, worker)
 		if err != nil {
 			return nil, nil, err
 		}

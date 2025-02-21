@@ -113,12 +113,7 @@ func Dalec2SourcesLLB(client gwclient.Client, worker llb.State, spec *dalec.Spec
 		return append(opts, dalec.ProgressGroup(s))
 	}
 
-	credHelper, err := frontend.GetGomodCredHelper(client)
-	if err != nil {
-		return nil, err
-	}
-
-	st, err := spec.GomodDeps(sOpt, worker, credHelper, withPG("Add gomod sources")...)
+	st, err := spec.GomodDeps(sOpt, worker, withPG("Add gomod sources")...)
 	if err != nil {
 		return nil, errors.Wrap(err, "error adding gomod sources")
 	}

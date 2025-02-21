@@ -51,7 +51,7 @@ func exit1(msg string) {
 	exit(msg, 1)
 }
 
-func main() {
+func gomodMain() {
 	var err error
 
 	if len(os.Args) < 3 {
