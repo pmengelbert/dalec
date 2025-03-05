@@ -1,11 +1,15 @@
 package test
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Azure/dalec"
@@ -14,6 +18,108 @@ import (
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/opencontainers/go-digest"
 )
+
+var (
+	isRootLess     bool
+	isRootlessOnce sync.Once
+)
+
+func TestSourceRootless(t *testing.T) {
+	t.Parallel()
+
+	const host = "host.docker.internal"
+
+	ctx := startTestSpan(baseCtx, t)
+	sourceName := "sock"
+	testSpec := func() *dalec.Spec {
+		return &dalec.Spec{
+			Args: map[string]string{
+				"BAR": "bar",
+			},
+			Name: "cmd-source-ref",
+			Sources: map[string]dalec.Source{
+				sourceName: {
+					Path: "/tmp/output",
+					Build: &dalec.SourceBuild{
+						Source: dalec.Source{
+							Inline: &dalec.SourceInline{
+								File: &dalec.SourceInlineFile{
+									Contents: `
+FROM mcr.microsoft.com/mirror/docker/library/alpine:3.16
+RUN apk add netcat-openbsd
+WORKDIR /tmp/output
+RUN echo "y he ohl taere" | nc -v ` + host + ` 9999 > out
+                                    `,
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	spec := testSpec()
+	testEnv.RunTest(ctx, t, func(ctx context.Context, c gwclient.Client) {
+		extraHost := "10.0.2.2"
+		if !isRootless(ctx, t, c) {
+			extraHost = getExtraHostRootful(t)
+		}
+
+		sr := newSolveRequest(withBuildTarget("debug/sources"), withSpec(ctx, t, spec), withExtraHost(host, extraHost))
+		res := solveT(ctx, t, c, sr)
+		checkFile(ctx, t, "sock/out", res, []byte("hey\n"))
+	})
+}
+
+func withExtraHost(host string, ipv4 string) func(cfg *newSolveRequestConfig) {
+	return func(cfg *newSolveRequestConfig) {
+		const addHostsKey = "add-hosts"
+		r := cfg.req
+
+		if r.FrontendOpt == nil {
+			r.FrontendOpt = make(map[string]string)
+		}
+
+		var prefix string
+		if existing, ok := r.FrontendOpt[addHostsKey]; ok {
+			prefix = existing + ","
+		}
+
+		r.FrontendOpt[addHostsKey] = fmt.Sprintf("%s%s=%s", prefix, host, ipv4)
+	}
+}
+
+func getExtraHostRootful(t *testing.T) string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			t.Log(err)
+			continue
+		}
+
+		for _, addr := range addrs {
+			if ip := addr.(*net.IPNet).IP.To4(); ip != nil {
+				if ip.IsLoopback() {
+					continue
+				}
+
+				if ip.IsPrivate() {
+					t.Log("IP ADDRESS", ip)
+					return ip.String()
+				}
+			}
+		}
+	}
+
+	t.FailNow()
+	return "host-gateway"
+}
 
 func TestSourceCmd(t *testing.T) {
 	t.Parallel()
@@ -712,4 +818,54 @@ func checkFileStat(t *testing.T, dir fs.FS, p string, opt checkFileStatOpt) {
 	if stat.IsDir() != opt.IsDir {
 		t.Errorf("expected file %q isDir=%v, got %v", p, opt.IsDir, stat.IsDir())
 	}
+}
+
+func isRootless(ctx context.Context, t *testing.T, client gwclient.Client) bool {
+	isRootlessOnce.Do(func() {
+		st := llb.Image("mcr.microsoft.com/azurelinux/base/core:3.0").Run(llb.Args([]string{
+			"bash", "-c", `
+set -exu
+read -r x < /proc/self/uid_map
+echo "$x" > /tmp/out
+            `,
+		})).AddMount("/tmp", llb.Scratch())
+		def, err := st.Marshal(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		res, err := client.Solve(ctx, gwclient.SolveRequest{
+			Definition: def.ToPB(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ref, err := res.SingleRef()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		bs, err := ref.ReadFile(ctx, gwclient.ReadRequest{
+			Filename: "/out",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		uidMap := bytes.NewBuffer(bs)
+		var a, b, c int
+		if _, err := fmt.Fscanf(uidMap, "%d %d %d", &a, &b, &c); err != nil {
+			// Assume we are in a regular, non user namespace.
+			isRootLess = false
+			return
+		}
+
+		// As per user_namespaces(7), /proc/self/uid_map of
+		// the initial user namespace shows 0 0 4294967295.
+		initNS := a == 0 && b == 0 && c == 4294967295
+		isRootLess = !initNS
+	})
+
+	return isRootLess
 }
