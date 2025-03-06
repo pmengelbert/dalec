@@ -1,6 +1,7 @@
 package test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"io/fs"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -15,9 +17,9 @@ import (
 
 	"github.com/Azure/dalec"
 	"github.com/Azure/dalec/frontend/pkg/bkfs"
+	ps "github.com/mitchellh/go-ps"
 	"github.com/moby/buildkit/client/llb"
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
-	"github.com/moby/buildkit/identity"
 	"github.com/opencontainers/go-digest"
 )
 
@@ -26,33 +28,38 @@ var (
 	isRootlessOnce sync.Once
 )
 
-func TestGomodGitAuth(t *testing.T) {
+func TestGomodGitAuthHTTPS(t *testing.T) {
 	t.Parallel()
 
 	const host = "host.docker.internal"
 
 	ctx := startTestSpan(baseCtx, t)
-	sourceName := "sock"
+	sourceName := "gitauth"
 
-	randomData := identity.NewID()
+	// randomData := identity.NewID()
 
-	testSpec := func() *dalec.Spec {
-		return &dalec.Spec{
-			Name: "cmd-source-ref",
+	testEnv.RunTest(ctx, t, func(ctx context.Context, c gwclient.Client) {
+		outsideAddr, insideAddr := getSvcAddrs(ctx, t, c)
+
+		port := getAvailablePort(t)
+		spec := &dalec.Spec{
+			Args: map[string]string{
+				"PORT": fmt.Sprintf("%d", port),
+			},
+			Name: "gomod-git-auth",
 			Sources: map[string]dalec.Source{
 				sourceName: {
-					Path: "/tmp/output",
-					Build: &dalec.SourceBuild{
-						Source: dalec.Source{
-							Inline: &dalec.SourceInline{
-								File: &dalec.SourceInlineFile{
-									Contents: `
-FROM mcr.microsoft.com/mirror/docker/library/alpine:3.16
-ARG PORT
-RUN apk add netcat-openbsd
-WORKDIR /tmp/output
-RUN echo "` + randomData + `" | nc -Nv ` + host + ` ${PORT} > out
-                                    `,
+					Git: &dalec.SourceGit{
+						URL:    fmt.Sprintf("https://host.docker.internal:%d/user/public.git", port),
+						Commit: "main",
+					},
+					Generate: []*dalec.SourceGenerator{
+						{
+							Gomod: &dalec.GeneratorGomod{
+								Auth: map[string]dalec.GomodGitAuth{
+									fmt.Sprintf("host.docker.internal:%d", port): {
+										Token: "super-secret",
+									},
 								},
 							},
 						},
@@ -60,35 +67,128 @@ RUN echo "` + randomData + `" | nc -Nv ` + host + ` ${PORT} > out
 				},
 			},
 		}
-	}
-
-	spec := testSpec()
-	testEnv.RunTest(ctx, t, func(ctx context.Context, c gwclient.Client) {
-		outsideAddr, insideAddr := getAddrs(ctx, t, c)
-
-		port := getAvailablePort(t)
-		spec.Sources[sourceName].Build.Args = map[string]string{
-			"PORT": fmt.Sprintf("%d", port),
-		}
 
 		go runTCPService(t, outsideAddr, port)
 
 		sr := newSolveRequest(withBuildTarget("debug/sources"), withSpec(ctx, t, spec), withExtraHost(host, insideAddr))
 		res := solveT(ctx, t, c, sr)
-		checkFile(ctx, t, "sock/out", res, []byte("hey\n"))
+		checkFile(ctx, t, "gitauth/out", res, []byte("hey\n"))
 	})
 }
 
-func getAddrs(ctx context.Context, t *testing.T, c gwclient.Client) (string, string) {
-	outsideAddr := "localhost"
-	insideAddr := "10.0.2.2"
+func getSvcAddrs(ctx context.Context, t *testing.T, c gwclient.Client) (string, string) {
+	const (
+		rootlessOutsideAddr = "localhost"
+		rootlessInsideAddr  = "10.0.2.2" // as per the docs
+	)
 
 	if !isRootless(ctx, t, c) {
-		outsideAddr = getExtraHostRootful(t)
-		insideAddr = outsideAddr
+		addr := getExtraHostRootful(t)
+		return addr, addr
 	}
 
-	return outsideAddr, insideAddr
+	// These may fast-fail the test if the configuration is wrong
+	dockerdPid := getDockerdPid(t)
+	assertDockerdEnvironment(t, dockerdPid)
+
+	return rootlessOutsideAddr, rootlessInsideAddr
+}
+
+func nullCharSplit(data []byte, atEOF bool) (int, []byte, error) {
+	var (
+		i   int
+		err error
+	)
+
+	for i = 0; i < len(data); i++ {
+		if data[i] == 0 {
+			break
+		}
+	}
+
+	if atEOF {
+		err = bufio.ErrFinalToken
+	}
+
+	return i + 1, data[:i], err
+}
+
+func assertDockerdEnvironment(t *testing.T, dockerdPid int) {
+	const (
+		envVarRootlessKitLocalhostKey   = "DOCKERD_ROOTLESS_ROOTLESSKIT_DISABLE_HOST_LOOPBACK"
+		envVarRootlessKitLocalhostValue = "false"
+	)
+
+	f, err := os.Open(fmt.Sprintf("/proc/%d/environ", dockerdPid))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Split(nullCharSplit)
+
+	for scanner.Scan() {
+		k, v, ok := strings.Cut(scanner.Text(), "=")
+		if !ok || k != envVarRootlessKitLocalhostKey {
+			continue
+		}
+
+		if v != envVarRootlessKitLocalhostValue {
+			t.Fatalf("You have a rootless setup. In order to permit TCP service forwarding, you must restart the docker daemon with the %q env var set to %q", envVarRootlessKitLocalhostKey, envVarRootlessKitLocalhostValue)
+		}
+	}
+}
+
+func getDockerdPid(t *testing.T) int {
+	const dockerProcName = "dockerd"
+	procs, err := ps.Processes()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	currentUser, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var pid int
+
+outer:
+	for _, proc := range procs {
+		name := proc.Executable()
+		if filepath.Base(name) != dockerProcName {
+			continue
+		}
+
+		pp := proc.Pid()
+
+		f, err := os.Open(fmt.Sprintf("/proc/%d/status", pp))
+		if err != nil {
+			t.Fatal(err)
+		}
+		scanner := bufio.NewScanner(f)
+
+		for scanner.Scan() {
+			t := scanner.Text()
+			_, val, ok := strings.Cut(t, "Uid:")
+			if !ok {
+				continue
+			}
+
+			val = strings.TrimSpace(val)
+			if !strings.HasPrefix(val, currentUser.Uid) {
+				continue outer
+			}
+
+			pid = pp
+			break outer
+		}
+	}
+
+	if pid == 0 {
+		t.Fatal("cannot find pid of docker daemon")
+	}
+	return pid
 }
 
 func runTCPService(t *testing.T, extraHost string, p int) {
