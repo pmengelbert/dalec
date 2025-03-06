@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -23,6 +24,8 @@ var (
 	isRootLess     bool
 	isRootlessOnce sync.Once
 )
+
+// func getPort(t *testing.T) int
 
 func TestSourceRootless(t *testing.T) {
 	t.Parallel()
@@ -46,9 +49,10 @@ func TestSourceRootless(t *testing.T) {
 								File: &dalec.SourceInlineFile{
 									Contents: `
 FROM mcr.microsoft.com/mirror/docker/library/alpine:3.16
+ARG PORT
 RUN apk add netcat-openbsd
 WORKDIR /tmp/output
-RUN echo "y he ohl taere" | nc -v ` + host + ` 9999 > out
+RUN echo " yhe hloet are" | nc -Nv ` + host + ` ${PORT} > out
                                     `,
 								},
 							},
@@ -65,6 +69,53 @@ RUN echo "y he ohl taere" | nc -v ` + host + ` 9999 > out
 		if !isRootless(ctx, t, c) {
 			extraHost = getExtraHostRootful(t)
 		}
+
+		addr, err := net.ResolveTCPAddr("tcp", ":0")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		l, err := net.ListenTCP("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		p := l.Addr().(*net.TCPAddr).Port
+		l.Close()
+
+		spec.Sources[sourceName].Build.Args = map[string]string{
+			"PORT": fmt.Sprintf("%d", p),
+		}
+
+		go func() {
+			h := extraHost
+			if h == "10.0.2.2" {
+				h = "localhost"
+			}
+			l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", h, p))
+			if err != nil {
+				panic(err)
+			}
+			defer l.Close()
+
+			c, err := l.Accept()
+			if err != nil {
+				panic(err)
+			}
+			defer c.Close()
+
+			// b := make([]byte, 1024*4, 1024*4)
+			b, err := io.ReadAll(c)
+			if err != nil {
+				panic(err)
+			}
+			t.Log(string(b))
+
+			s := []byte("hey\n")
+			if _, err := c.Write(s); err != nil {
+				panic(err)
+			}
+		}()
 
 		sr := newSolveRequest(withBuildTarget("debug/sources"), withSpec(ctx, t, spec), withExtraHost(host, extraHost))
 		res := solveT(ctx, t, c, sr)
