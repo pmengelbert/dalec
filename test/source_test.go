@@ -17,6 +17,7 @@ import (
 
 	"github.com/Azure/dalec"
 	"github.com/Azure/dalec/frontend/pkg/bkfs"
+	"github.com/Azure/dalec/test/testenv"
 	ps "github.com/mitchellh/go-ps"
 	"github.com/moby/buildkit/client/llb"
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
@@ -31,7 +32,11 @@ var (
 func TestGomodGitAuthHTTPS(t *testing.T) {
 	t.Parallel()
 
-	const host = "host.docker.internal"
+	// this is needed because go behaves differently when the host is
+	// recognized if it sees `host.docker.internal` it will first try to
+	// resolve the metadata by connecting to the resolved IP address on port
+	// 443, which will fail.
+	const host = "github.com"
 
 	ctx := startTestSpan(baseCtx, t)
 	sourceName := "gitauth"
@@ -42,22 +47,30 @@ func TestGomodGitAuthHTTPS(t *testing.T) {
 		outsideAddr, insideAddr := getSvcAddrs(ctx, t, c)
 
 		port := getAvailablePort(t)
+		port = 9999
 		spec := &dalec.Spec{
-			Args: map[string]string{
-				"PORT": fmt.Sprintf("%d", port),
-			},
 			Name: "gomod-git-auth",
 			Sources: map[string]dalec.Source{
 				sourceName: {
-					Git: &dalec.SourceGit{
-						URL:    fmt.Sprintf("https://host.docker.internal:%d/user/public.git", port),
-						Commit: "main",
+					Inline: &dalec.SourceInline{
+						Dir: &dalec.SourceInlineDir{
+							Files: map[string]*dalec.SourceInlineFile{
+								"go.mod": {
+									Contents: `module ` + host + `/user/public
+
+go 1.23.5
+
+require ` + host + `/user/private v0.0.0
+`,
+								},
+							},
+						},
 					},
 					Generate: []*dalec.SourceGenerator{
 						{
 							Gomod: &dalec.GeneratorGomod{
 								Auth: map[string]dalec.GomodGitAuth{
-									fmt.Sprintf("host.docker.internal:%d", port): {
+									fmt.Sprintf("%s:%d", host, port): {
 										Token: "super-secret",
 									},
 								},
@@ -67,13 +80,41 @@ func TestGomodGitAuthHTTPS(t *testing.T) {
 				},
 			},
 		}
+		spec.FillDefaults()
+		// pip := net.ParseIP(insideAddr)
+		worker := llb.Image("alpine:latest", llb.WithMetaResolver(c)).
+			Run(llb.Shlex("apk add --no-cache go git ca-certificates patch openssh")).Root()
+		worker = worker.Run(
+			llb.Shlex(`sh -c 'git config --global "url.http://${HOST}:${PORT}/.insteadOf" "https://${HOST}"'`),
+			llb.AddEnv("HOST", host),
+			llb.AddEnv("PORT", fmt.Sprintf("%d", port)),
+		).Root()
+		worker = worker.AddExtraHost(host, net.ParseIP(insideAddr))
 
-		go runTCPService(t, outsideAddr, port)
+		// ec := make(chan error)
+		// go runTCPService(t, outsideAddr, port, ec)
 
-		sr := newSolveRequest(withBuildTarget("debug/sources"), withSpec(ctx, t, spec), withExtraHost(host, insideAddr))
+		_ = outsideAddr
+		sr := newSolveRequest(withBuildTarget("debug/gomods"), withSpec(ctx, t, spec), withExtraHost(host, insideAddr), withBuildContext(ctx, t, "gomod-worker", worker))
+
 		res := solveT(ctx, t, c, sr)
-		checkFile(ctx, t, "gitauth/out", res, []byte("hey\n"))
-	})
+		// if err := <-ec; err != nil {
+		// 	t.Fatal(err)
+		// }
+		x, err := res.SingleRef()
+		if err != nil {
+			t.Fatal(err)
+		}
+		y, err := x.ReadFile(ctx, gwclient.ReadRequest{
+			Filename: "/root/.gitconfig",
+		})
+		t.Fatalf("%s\n", string(y))
+
+		// checkFile(ctx, t, "gitauth/go.mod", res, []byte("hey\n"))
+	}, testenv.WithSecrets(testenv.KeyVal{
+		K: "super-secret",
+		V: "value",
+	}))
 }
 
 func getSvcAddrs(ctx context.Context, t *testing.T, c gwclient.Client) (string, string) {
@@ -191,32 +232,61 @@ outer:
 	return pid
 }
 
-func runTCPService(t *testing.T, extraHost string, p int) {
-	h := extraHost
-	if h == "10.0.2.2" {
-		h = "localhost"
-	}
-	l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", h, p))
+func runTCPService(t *testing.T, outsideAddr string, p int, ec chan error) {
+	l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", outsideAddr, p))
 	if err != nil {
-		panic(err)
+		ec <- err
+		return
 	}
 	defer l.Close()
 
 	c, err := l.Accept()
 	if err != nil {
-		panic(err)
+		ec <- err
+		return
 	}
 	defer c.Close()
 
 	b, err := io.ReadAll(c)
 	if err != nil {
-		panic(err)
+		ec <- err
+		return
 	}
 	t.Log(string(b))
 
 	s := []byte("hey\n")
 	if _, err := c.Write(s); err != nil {
-		panic(err)
+		ec <- err
+		return
+	}
+}
+
+func runGitServer(t *testing.T, outsideAddr string, p int, ec chan error) {
+	l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", outsideAddr, p))
+	if err != nil {
+		ec <- err
+		return
+	}
+	defer l.Close()
+
+	c, err := l.Accept()
+	if err != nil {
+		ec <- err
+		return
+	}
+	defer c.Close()
+
+	b, err := io.ReadAll(c)
+	if err != nil {
+		ec <- err
+		return
+	}
+	t.Log(string(b))
+
+	s := []byte("hey\n")
+	if _, err := c.Write(s); err != nil {
+		ec <- err
+		return
 	}
 }
 
