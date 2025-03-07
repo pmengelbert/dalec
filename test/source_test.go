@@ -5,9 +5,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"io/fs"
 	"net"
+	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -15,6 +15,8 @@ import (
 	"sync"
 	"testing"
 
+	githttp "github.com/AaronO/go-git-http"
+	"github.com/AaronO/go-git-http/auth"
 	"github.com/Azure/dalec"
 	"github.com/Azure/dalec/frontend/pkg/bkfs"
 	"github.com/Azure/dalec/test/testenv"
@@ -47,7 +49,6 @@ func TestGomodGitAuthHTTPS(t *testing.T) {
 		outsideAddr, insideAddr := getSvcAddrs(ctx, t, c)
 
 		port := getAvailablePort(t)
-		port = 9999
 		spec := &dalec.Spec{
 			Name: "gomod-git-auth",
 			Sources: map[string]dalec.Source{
@@ -84,33 +85,26 @@ require ` + host + `/user/private v0.0.0
 		// pip := net.ParseIP(insideAddr)
 		worker := llb.Image("alpine:latest", llb.WithMetaResolver(c)).
 			Run(llb.Shlex("apk add --no-cache go git ca-certificates patch openssh")).Root()
+
+		// tell git to use the port along with the host
 		worker = worker.Run(
 			llb.Shlex(`sh -c 'git config --global "url.http://${HOST}:${PORT}/.insteadOf" "https://${HOST}"'`),
 			llb.AddEnv("HOST", host),
 			llb.AddEnv("PORT", fmt.Sprintf("%d", port)),
 		).Root()
-		worker = worker.AddExtraHost(host, net.ParseIP(insideAddr))
 
-		// ec := make(chan error)
-		// go runTCPService(t, outsideAddr, port, ec)
+		// tell git to use the credential helper for the host:port combination
+		worker = worker.Run(
+			llb.Shlex(`sh -c 'git config --global credential."http://${HOST}:${PORT}.helper" "/usr/local/bin/frontend credential-helper --kind=token"'`),
+			llb.AddEnv("HOST", host),
+			llb.AddEnv("PORT", fmt.Sprintf("%d", port)),
+		).Root()
 
-		_ = outsideAddr
+		go runGitServer(outsideAddr, port)
+
 		sr := newSolveRequest(withBuildTarget("debug/gomods"), withSpec(ctx, t, spec), withExtraHost(host, insideAddr), withBuildContext(ctx, t, "gomod-worker", worker))
-
 		res := solveT(ctx, t, c, sr)
-		// if err := <-ec; err != nil {
-		// 	t.Fatal(err)
-		// }
-		x, err := res.SingleRef()
-		if err != nil {
-			t.Fatal(err)
-		}
-		y, err := x.ReadFile(ctx, gwclient.ReadRequest{
-			Filename: "/root/.gitconfig",
-		})
-		t.Fatalf("%s\n", string(y))
-
-		// checkFile(ctx, t, "gitauth/go.mod", res, []byte("hey\n"))
+		checkFile(ctx, t, "github.com/user/private@v0.0.0/hello", res, []byte("hello\n"))
 	}, testenv.WithSecrets(testenv.KeyVal{
 		K: "super-secret",
 		V: "value",
@@ -232,61 +226,33 @@ outer:
 	return pid
 }
 
-func runTCPService(t *testing.T, outsideAddr string, p int, ec chan error) {
-	l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", outsideAddr, p))
+func runGitServer(addr string, port int) {
+	wd, err := os.Getwd()
 	if err != nil {
-		ec <- err
-		return
+		panic(err)
 	}
-	defer l.Close()
 
-	c, err := l.Accept()
+	wd, err = filepath.Abs(wd)
 	if err != nil {
-		ec <- err
-		return
+		panic(err)
 	}
-	defer c.Close()
 
-	b, err := io.ReadAll(c)
-	if err != nil {
-		ec <- err
-		return
-	}
-	t.Log(string(b))
+	git := githttp.New(filepath.Join(wd, "fixtures/git/"))
+	authr := auth.Authenticator(func(ai auth.AuthInfo) (bool, error) {
+		if ai.Push {
+			return false, nil
+		}
 
-	s := []byte("hey\n")
-	if _, err := c.Write(s); err != nil {
-		ec <- err
-		return
-	}
-}
+		if ai.Username == "x-access-token" && ai.Password == "value" {
+			return true, nil
+		}
 
-func runGitServer(t *testing.T, outsideAddr string, p int, ec chan error) {
-	l, err := net.Listen("tcp", fmt.Sprintf("%s:%d", outsideAddr, p))
-	if err != nil {
-		ec <- err
-		return
-	}
-	defer l.Close()
+		return false, nil
+	})
 
-	c, err := l.Accept()
-	if err != nil {
-		ec <- err
-		return
-	}
-	defer c.Close()
-
-	b, err := io.ReadAll(c)
-	if err != nil {
-		ec <- err
-		return
-	}
-	t.Log(string(b))
-
-	s := []byte("hey\n")
-	if _, err := c.Write(s); err != nil {
-		ec <- err
-		return
+	http.Handle("/", authr(git))
+	if err := http.ListenAndServe(fmt.Sprintf("%s:%d", addr, port), nil); err != nil {
+		panic(err)
 	}
 }
 

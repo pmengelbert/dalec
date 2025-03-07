@@ -1,7 +1,0 @@
-- check if rootless
-    - yes: check env var on docker daemon
-        - not present: fail
-        - proceed with binding to localhost
-    - no: query interfaces for available addresses
-          add-hosts: host.docker.internal=host-gateway
-- plumb through the add-hosts
