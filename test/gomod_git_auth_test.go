@@ -41,12 +41,11 @@ func TestGomodGitAuthHTTPS(t *testing.T) {
 	netHostTestEnv := testenv.NewWithBuildxInstance(ctx, t)
 
 	netHostTestEnv.RunTest(ctx, t, func(ctx context.Context, c gwclient.Client) {
-		const gomodFmt = `module %[1]s/user/public
-
-go 1.23.5
-
-require %[1]s/user/private.git %[2]s
-`
+		const gomodFmt = "module %[1]s/user/public\n" +
+			"\n" +
+			"go 1.23.5\n" +
+			"\n" +
+			"require %[1]s/user/private.git %[2]s\n"
 
 		gomodContents := fmt.Sprintf(gomodFmt, host, tag)
 		port := getAvailablePort(t)
@@ -117,6 +116,101 @@ require %[1]s/user/private.git %[2]s
 	}), testenv.WithHostNetworking)
 }
 
+func TestGomodGitAuthSSH(t *testing.T) {
+	const gituser = "gituser"
+	const sshID = "dalecssh"
+
+	t.Parallel()
+
+	ctx := startTestSpan(baseCtx, t)
+	sourceName := "gitauth"
+
+	tag := identity.NewID()
+	netHostTestEnv := testenv.NewWithBuildxInstance(ctx, t)
+
+	netHostTestEnv.RunTest(ctx, t, func(ctx context.Context, c gwclient.Client) {
+		const gomodFmt = `module %[1]s/user/public
+
+go 1.23.5
+
+require %[1]s/user/private.git %[2]s
+`
+
+		gomodContents := fmt.Sprintf(gomodFmt, host, tag)
+		port := getAvailablePort(t)
+
+		spec := &dalec.Spec{
+			Name: "gomod-git-auth",
+			Sources: map[string]dalec.Source{
+				sourceName: {
+					Inline: &dalec.SourceInline{
+						Dir: &dalec.SourceInlineDir{
+							Files: map[string]*dalec.SourceInlineFile{
+								"go.mod": {
+									Contents: gomodContents,
+								},
+							},
+						},
+					},
+					Generate: []*dalec.SourceGenerator{
+						{
+							Gomod: &dalec.GeneratorGomod{
+								Auth: map[string]dalec.GomodGitAuth{
+									fmt.Sprintf("%s:%s", host, port): {
+										SSH: &dalec.GomodGitAuthSSH{
+											ID:       sshID,
+											Username: gituser,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		// Private git repo
+		modFile := fmt.Sprintf("module %s/user/private.git\n"+
+			"\n"+
+			"\n"+
+			"go 1.23.5\n", host)
+
+		repo := llb.Scratch().
+			File(
+				llb.Mkdir(repoDir, 0o755, llb.WithParents(true))).
+			Dir(repoDir).
+			File(
+				llb.Mkfile("hello", 0o644, []byte("hello\n")).
+					Mkfile("go.mod", 0o644, []byte(modFile)),
+			)
+
+		if err := runSSHServer(ctx, t, c, repo, port, tag); err != nil {
+			t.Fatal(err)
+		}
+
+		sr := newSolveRequest(
+			withBuildTarget("debug/gomods"),
+			withSpec(ctx, t, spec),
+			withExtraHost(host, addr),
+			withBuildContext(ctx, t, "gomod-worker", initGomodWorker(c, host, port)),
+		)
+
+		const outDirBase = host + "/user"
+		res := solveT(ctx, t, c, sr)
+		modDir := getDirName(ctx, t, res, outDirBase, "hello")
+
+		filename := filepath.Join(outDirBase, modDir, "hello")
+		checkFile(ctx, t, filename, res, []byte("hello\n"))
+	}, testenv.WithSecrets(testenv.KeyVal{
+		K: "super-secret",
+		V: "value",
+	}), testenv.WithHostNetworking)
+}
+
+func runSSHServer(ctx context.Context, t *testing.T, c gwclient.Client, repo llb.State, port, tag string) error {
+	panic("unimplemented")
+}
 func getDirName(ctx context.Context, t *testing.T, res *gwclient.Result, base, dirPattern string) string {
 	ref, err := res.SingleRef()
 	if err != nil {
