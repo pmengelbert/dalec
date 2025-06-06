@@ -30,7 +30,7 @@ import (
 
 const (
 	serverRoot     = "/git_server"
-	repoDir        = "/user/private"
+	repoDir        = "/root/user/private"
 	repoMountpoint = serverRoot + repoDir
 
 	host = "host.docker.internal"
@@ -123,7 +123,7 @@ func TestGomodGitAuthHTTPS(t *testing.T) {
 }
 
 func TestGomodGitAuthSSH(t *testing.T) {
-	const gituser = "gituser"
+	const gituser = "root"
 	const sshID = "dalecssh"
 
 	t.Parallel()
@@ -321,7 +321,7 @@ git init --bare
 	envArr := env.ToArray()
 
 	cp, err := cont.Start(ctx, gwclient.StartRequest{
-		Args:   []string{"sh", "-c", "ssh-keygen -A && /usr/sbin/sshd -p " + port + " -Dd"},
+		Args:   []string{"sh", "-c", "ssh-keygen -A && /usr/sbin/sshd -p " + port + " -D"},
 		Env:    envArr,
 		Stdin:  os.Stdin,
 		Stdout: os.Stdout,
@@ -330,8 +330,6 @@ git init --bare
 	if err != nil {
 		t.Fatalf("could not start ssh server container: %s", err)
 	}
-
-	t.Logf("ssh server is running?")
 
 	go func() {
 		if err := cp.Wait(); err != nil {
@@ -368,16 +366,6 @@ done
 	}
 
 	t.Logf("ssh server is online")
-	// ssh -D
-
-	// res, _ := client.Solve(ctx, gwclient.SolveRequest{
-	// 	Definition: def.ToPB(),
-	// })
-	// // ref, _ := res.SingleRef()
-	// checkFile(ctx, t, "HEAD", res, []byte("ref: refs/heads/master\n"))
-	// pubkey, privkey := genSSHKeypair(ctx, t)
-	// _ = pubkey
-	// _ = privkey
 }
 
 func genSSHKeypair(ctx context.Context, t *testing.T, worker llb.State) ([]byte, []byte) {
