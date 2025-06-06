@@ -1,7 +1,11 @@
 package test
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -20,6 +24,7 @@ import (
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/solver/pb"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/crypto/ssh"
 )
 
 const (
@@ -185,9 +190,9 @@ require %[1]s/user/private.git %[2]s
 					Mkfile("go.mod", 0o644, []byte(modFile)),
 			)
 
-		if err := runSSHServer(ctx, t, c, repo, port, tag); err != nil {
-			t.Fatal(err)
-		}
+		privkey := runSSHServer(ctx, t, c, repo, port, tag)
+		t.Log("did it")
+		return
 
 		sr := newSolveRequest(
 			withBuildTarget("debug/gomods"),
@@ -208,9 +213,124 @@ require %[1]s/user/private.git %[2]s
 	}), testenv.WithHostNetworking)
 }
 
-func runSSHServer(ctx context.Context, t *testing.T, c gwclient.Client, repo llb.State, port, tag string) error {
+func runSSHServer(ctx context.Context, t *testing.T, client gwclient.Client, repo llb.State, port, tag string) []byte {
+	worker := initGomodWorker(client, host, port)
+	worker = worker.File(llb.Copy(repo, "/", serverRoot))
+	gitDir := worker.Dir(repoMountpoint).Run(dalec.ShArgsf(`et -ex
+export GIT_CONFIG_NOGLOBAL=true
+git init
+git config user.name foo
+git config user.email foo@bar.com
+
+git add -A
+git commit -m commit --no-gpg-sign
+git tag %s
+    `, tag)).AddMount(repoMountpoint+"/.git", llb.Scratch())
+
+	bareGitRepo := worker.Dir(serverRoot).Run(dalec.ShArgs(`
+git init --bare
+    `)).AddMount(serverRoot, gitDir)
+
+	pubkey, privkey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("could not generate ssh keypair: %s", err)
+	}
+
+	k, err := ssh.NewPublicKey(pubkey)
+	if err != nil {
+		t.Fatalf("could not parse ssh public key: %s", err)
+	}
+	pubkeyBytes := ssh.MarshalAuthorizedKey(k)
+	var b bytes.Buffer
+
+	blk, err := ssh.MarshalPrivateKey(privkey, "")
+	if err != nil {
+		t.Fatalf("could not parse ssh public key: %s", err)
+	}
+	if err := pem.Encode(&b, blk); err != nil {
+		t.Fatalf("could not encode ssh private key to pem: %s", err)
+	}
+
+	worker = worker.File(
+		llb.Mkdir("/root/.ssh", 0o600, llb.WithParents(true)).
+			Mkfile("/root/.ssh/authorized_keys", 0o600, pubkeyBytes),
+	)
+
+	fmt.Println(b.String())
+
+	workerRef := stateToRef(ctx, t, client, worker)
+	bareGitRepoRef := stateToRef(ctx, t, client, bareGitRepo)
+
+	cont, err := client.NewContainer(ctx, gwclient.NewContainerRequest{
+		Mounts: []gwclient.Mount{
+			{
+				Dest: "/",
+				Ref:  workerRef,
+			},
+			{
+				Dest: "/root/user/private",
+				Ref:  bareGitRepoRef,
+			},
+		},
+		NetMode: pb.NetMode_HOST,
+		ExtraHosts: []*pb.HostIP{
+			{
+				Host: host,
+				IP:   addr,
+			},
+		},
+		Constraints: &pb.WorkerConstraints{
+			Filter: []string{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("could not create ssh server container: %s", err)
+	}
+
+	env, err := worker.Env(ctx)
+	if err != nil {
+		t.Logf("unable to copy env: %s", err)
+	}
+
+	envArr := env.ToArray()
+
+	cp, err := cont.Start(ctx, gwclient.StartRequest{
+		Args:   []string{"sh", "-c", "ssh-keygen -A && /usr/sbin/sshd -p " + port + " -Dd"},
+		Env:    envArr,
+		Cwd:    "/root",
+		Tty:    false,
+		Stdin:  os.Stdin,
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+	})
+	if err != nil {
+		t.Fatalf("could not start ssh server container: %s", err)
+	}
+
+	t.Logf("ssh server is running?")
+
+	if err := cp.Wait(); err != nil {
+		t.Fatalf("error running ssh sever container: %s", err)
+	}
+	// ssh -D
+
+	// res, _ := client.Solve(ctx, gwclient.SolveRequest{
+	// 	Definition: def.ToPB(),
+	// })
+	// // ref, _ := res.SingleRef()
+	// checkFile(ctx, t, "HEAD", res, []byte("ref: refs/heads/master\n"))
+	// pubkey, privkey := genSSHKeypair(ctx, t)
+	// _ = pubkey
+	// _ = privkey
+	return nil
+
 	panic("unimplemented")
 }
+
+func genSSHKeypair(ctx context.Context, t *testing.T, worker llb.State) ([]byte, []byte) {
+	return nil, nil
+}
+
 func getDirName(ctx context.Context, t *testing.T, res *gwclient.Result, base, dirPattern string) string {
 	ref, err := res.SingleRef()
 	if err != nil {
