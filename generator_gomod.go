@@ -131,7 +131,7 @@ func (g *SourceGenerator) gitconfigGeneratorScript(scriptPath string) llb.State 
 
 	fmt.Fprintf(&script, "go env -w GOPRIVATE=%s", strings.Join(goPrivate, ","))
 	script.WriteRune('\n')
-	fmt.Fprintln(&script, "go mod download")
+	fmt.Fprintln(&script, "go mod download -x")
 	return llb.Scratch().File(llb.Mkfile(scriptPath, 0o755, script.Bytes()))
 }
 
@@ -161,7 +161,7 @@ func (g *SourceGenerator) withGomodSecretsAndSockets() llb.RunOption {
 
 				llb.AddEnv(
 					"GIT_SSH_COMMAND",
-					`ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no`,
+					`ssh -p 9999 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no`,
 				).SetRunOption(ei)
 			}
 		}

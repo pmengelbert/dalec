@@ -21,6 +21,7 @@ import (
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/secrets/secretsprovider"
+	"github.com/moby/buildkit/session/sshforward/sshprovider"
 	"github.com/moby/buildkit/solver/pb"
 	spb "github.com/moby/buildkit/sourcepolicy/pb"
 	"github.com/opencontainers/go-digest"
@@ -278,6 +279,23 @@ func WithSecrets(kvs ...KeyVal) TestRunnerOpt {
 				m[kv.K] = []byte(kv.V)
 			}
 			so.Session = []session.Attachable{secretsprovider.FromMap(m)}
+		})
+	}
+}
+
+func WithSSHSocket(id, addr string) TestRunnerOpt {
+	return func(cfg *TestRunnerConfig) {
+		a, err := sshprovider.NewSSHAgentProvider([]sshprovider.AgentConfig{
+			{
+				ID:    id,
+				Paths: []string{addr},
+			},
+		})
+		if err != nil {
+			panic(err)
+		}
+		cfg.SolveOptFns = append(cfg.SolveOptFns, func(so *client.SolveOpt) {
+			so.Session = []session.Attachable{a}
 		})
 	}
 }

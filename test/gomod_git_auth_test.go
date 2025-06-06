@@ -25,6 +25,7 @@ import (
 	"github.com/moby/buildkit/solver/pb"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 )
 
 const (
@@ -132,8 +133,11 @@ func TestGomodGitAuthSSH(t *testing.T) {
 
 	tag := identity.NewID()
 	netHostTestEnv := testenv.NewWithBuildxInstance(ctx, t)
+	sockfile := "/tmp/dalec.test.socket." + tag
+	pubkeyBytes := runSSHAgent(ctx, t, sockfile)
 
 	netHostTestEnv.RunTest(ctx, t, func(ctx context.Context, c gwclient.Client) {
+		defer os.RemoveAll(sockfile)
 		const gomodFmt = `module %[1]s/user/public
 
 go 1.23.5
@@ -142,7 +146,7 @@ require %[1]s/user/private.git %[2]s
 `
 
 		gomodContents := fmt.Sprintf(gomodFmt, host, tag)
-		port := getAvailablePort(t)
+		port := "9999"
 
 		spec := &dalec.Spec{
 			Name: "gomod-git-auth",
@@ -161,7 +165,7 @@ require %[1]s/user/private.git %[2]s
 						{
 							Gomod: &dalec.GeneratorGomod{
 								Auth: map[string]dalec.GomodGitAuth{
-									fmt.Sprintf("%s:%s", host, port): {
+									host: {
 										SSH: &dalec.GomodGitAuthSSH{
 											ID:       sshID,
 											Username: gituser,
@@ -190,9 +194,7 @@ require %[1]s/user/private.git %[2]s
 					Mkfile("go.mod", 0o644, []byte(modFile)),
 			)
 
-		privkey := runSSHServer(ctx, t, c, repo, port, tag)
-		t.Log("did it")
-		return
+		runSSHServer(ctx, t, c, repo, port, tag, pubkeyBytes)
 
 		sr := newSolveRequest(
 			withBuildTarget("debug/gomods"),
@@ -210,10 +212,56 @@ require %[1]s/user/private.git %[2]s
 	}, testenv.WithSecrets(testenv.KeyVal{
 		K: "super-secret",
 		V: "value",
-	}), testenv.WithHostNetworking)
+	}), testenv.WithHostNetworking, testenv.WithSSHSocket(sshID, sockfile))
 }
 
-func runSSHServer(ctx context.Context, t *testing.T, client gwclient.Client, repo llb.State, port, tag string) []byte {
+// Returns pubkey already marshaled for use in ssh server
+func runSSHAgent(ctx context.Context, t *testing.T, sockfile string) []byte {
+	pubkey, privkey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("could not generate ssh keypair: %s", err)
+	}
+
+	k, err := ssh.NewPublicKey(pubkey)
+	if err != nil {
+		t.Fatalf("could not parse ssh public key: %s", err)
+	}
+	pubkeyBytes := ssh.MarshalAuthorizedKey(k)
+
+	var b bytes.Buffer
+	blk, err := ssh.MarshalPrivateKey(privkey, "")
+	if err != nil {
+		t.Fatalf("could not parse ssh public key: %s", err)
+	}
+	if err := pem.Encode(&b, blk); err != nil {
+		t.Fatalf("could not encode ssh private key to pem: %s", err)
+	}
+
+	kr := agent.NewKeyring()
+	kr.Add(agent.AddedKey{
+		PrivateKey: &privkey,
+	})
+
+	listener, err := net.Listen("unix", sockfile)
+	if err != nil {
+		t.Fatalf("can't listen on unix socket: %s", err)
+	}
+
+	go func() {
+		c, err := listener.Accept()
+		if err != nil {
+			t.Fatalf("listener.Accept: %s", err)
+		}
+
+		if err := agent.ServeAgent(kr, c); err != nil {
+			t.Fatalf("cannot serve agent: %s", err)
+		}
+	}()
+
+	return pubkeyBytes
+}
+
+func runSSHServer(ctx context.Context, t *testing.T, client gwclient.Client, repo llb.State, port, tag string, pubkey []byte) {
 	worker := initGomodWorker(client, host, port)
 	worker = worker.File(llb.Copy(repo, "/", serverRoot))
 	gitDir := worker.Dir(repoMountpoint).Run(dalec.ShArgsf(`et -ex
@@ -231,32 +279,10 @@ git tag %s
 git init --bare
     `)).AddMount(serverRoot, gitDir)
 
-	pubkey, privkey, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("could not generate ssh keypair: %s", err)
-	}
-
-	k, err := ssh.NewPublicKey(pubkey)
-	if err != nil {
-		t.Fatalf("could not parse ssh public key: %s", err)
-	}
-	pubkeyBytes := ssh.MarshalAuthorizedKey(k)
-	var b bytes.Buffer
-
-	blk, err := ssh.MarshalPrivateKey(privkey, "")
-	if err != nil {
-		t.Fatalf("could not parse ssh public key: %s", err)
-	}
-	if err := pem.Encode(&b, blk); err != nil {
-		t.Fatalf("could not encode ssh private key to pem: %s", err)
-	}
-
 	worker = worker.File(
 		llb.Mkdir("/root/.ssh", 0o600, llb.WithParents(true)).
-			Mkfile("/root/.ssh/authorized_keys", 0o600, pubkeyBytes),
+			Mkfile("/root/.ssh/authorized_keys", 0o600, pubkey),
 	)
-
-	fmt.Println(b.String())
 
 	workerRef := stateToRef(ctx, t, client, worker)
 	bareGitRepoRef := stateToRef(ctx, t, client, bareGitRepo)
@@ -297,8 +323,6 @@ git init --bare
 	cp, err := cont.Start(ctx, gwclient.StartRequest{
 		Args:   []string{"sh", "-c", "ssh-keygen -A && /usr/sbin/sshd -p " + port + " -Dd"},
 		Env:    envArr,
-		Cwd:    "/root",
-		Tty:    false,
 		Stdin:  os.Stdin,
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,
@@ -309,9 +333,41 @@ git init --bare
 
 	t.Logf("ssh server is running?")
 
-	if err := cp.Wait(); err != nil {
-		t.Fatalf("error running ssh sever container: %s", err)
+	go func() {
+		if err := cp.Wait(); err != nil {
+			t.Logf("error running ssh sever container: %s", err)
+		}
+	}()
+
+	t.Log("waiting for ssh server to come online")
+	ctxT, cancel := context.WithTimeout(ctx, time.Second*20)
+	defer cancel()
+
+	envArr = append(envArr, "HOST="+host, "ADDR="+addr, "PORT="+port)
+
+	untilConnected, err := cont.Start(ctxT, gwclient.StartRequest{
+		Env: envArr,
+		Args: []string{
+			"sh", "-c", `
+while ! nc -zw5 "$ADDR" "$PORT"; do
+	sleep 0.1
+done
+			`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("could not check progress of git server: %s", err)
 	}
+
+	if err := untilConnected.Wait(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Could not start git server: %s", err)
+		}
+
+		t.Fatalf("could not check progress of git server: %s", err)
+	}
+
+	t.Logf("ssh server is online")
 	// ssh -D
 
 	// res, _ := client.Solve(ctx, gwclient.SolveRequest{
@@ -322,9 +378,6 @@ git init --bare
 	// pubkey, privkey := genSSHKeypair(ctx, t)
 	// _ = pubkey
 	// _ = privkey
-	return nil
-
-	panic("unimplemented")
 }
 
 func genSSHKeypair(ctx context.Context, t *testing.T, worker llb.State) ([]byte, []byte) {
@@ -356,6 +409,7 @@ func initGomodWorker(c gwclient.Client, host, port string) llb.State {
 	worker := llb.Image("alpine:latest", llb.Platform(ocispecs.Platform{Architecture: runtime.GOARCH, OS: "linux"}), llb.WithMetaResolver(c)).
 		Run(llb.Shlex("apk add --no-cache go git ca-certificates patch openssh netcat-openbsd")).Root()
 
+	return worker
 	run := func(cmd string) {
 		// tell git to use the port along with the host
 		worker = worker.Run(
