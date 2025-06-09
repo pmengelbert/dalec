@@ -110,7 +110,7 @@ func (g *SourceGenerator) gitconfigGeneratorScript(scriptPath string) llb.State 
 			// package, and it will specify the remote url as https://<package
 			// name>. Because SSH auth was requested for this host, tell git to
 			// use ssh for upstreams with this host name.
-			fmt.Fprintf(&script, `git config --global url."ssh://%[1]s@%[2]s:".insteadOf https://%[2]s/`, username, host)
+			fmt.Fprintf(&script, `git config --global url."ssh://%[1]s@%[2]s/".insteadOf https://%[3]s/`, username, host, gpHost)
 			script.WriteRune('\n')
 			continue
 		}
@@ -131,9 +131,7 @@ func (g *SourceGenerator) gitconfigGeneratorScript(scriptPath string) llb.State 
 
 	fmt.Fprintf(&script, "go env -w GOPRIVATE=%s", strings.Join(goPrivate, ","))
 	script.WriteRune('\n')
-	fmt.Fprintf(&script, "go env -w GOINSECURE=%s", strings.Join(goPrivate, ","))
-	script.WriteRune('\n')
-	fmt.Fprintln(&script, "cat /root/.gitconfig && go mod download -x")
+	fmt.Fprintln(&script, "go mod download")
 	return llb.Scratch().File(llb.Mkfile(scriptPath, 0o755, script.Bytes()))
 }
 
@@ -163,7 +161,7 @@ func (g *SourceGenerator) withGomodSecretsAndSockets() llb.RunOption {
 
 				llb.AddEnv(
 					"GIT_SSH_COMMAND",
-					`ssh -p 9999 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no`,
+					`ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no`,
 				).SetRunOption(ei)
 			}
 		}

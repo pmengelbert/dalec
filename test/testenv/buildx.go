@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -371,36 +372,55 @@ func (b *BuildxEnv) RunTest(ctx context.Context, t *testing.T, f TestFunc, opts 
 	}
 }
 
-func NewWithBuildxInstance(ctx context.Context, t *testing.T) *BuildxEnv {
+var (
+	netHostTestEnv            *BuildxEnv
+	netHostTestEnvOnce        sync.Once
+	netHostTestEnvCleanupOnce sync.Once
+)
+
+func NewWithNetHostBuildxInstance(ctx context.Context, t *testing.T) *BuildxEnv {
 	dgst := digest.Canonical.Encode([]byte(t.Name()))
-	name := "dalec_integration_test_" + dgst[:12]
 
-	b := New().WithBuilder(name)
-	ctxT, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := b.bootstrap(ctxT); err != nil {
-		cmd := exec.CommandContext(ctx, "docker", "buildx", "create", "--name", name, "--driver", "docker-container", "--driver-opt", "network=host", "--buildkitd-flags", "'--allow-insecure-entitlement=network.host'")
-		out, err := cmd.CombinedOutput()
-		assert.NilError(t, err, "failed to create buildx builder: %s", string(out))
-
-		t.Cleanup(func() {
-			ctx := context.WithoutCancel(ctx)
-			cmd := exec.CommandContext(ctx, "docker", "buildx", "rm", name)
-			out, err := cmd.CombinedOutput()
-			assert.NilError(t, err, "failed to remove buildx builder: %s", string(out))
-		})
-
-		cmd = exec.CommandContext(ctx, "docker", "buildx", "inspect", name, "--bootstrap")
-		out, err = cmd.CombinedOutput()
-		assert.NilError(t, err, "failed to create buildx builder: %s", string(out))
-
-		b = New().WithBuilder(name)
-		if err := b.bootstrap(ctx); err != nil {
-			t.Fatalf("failed to bootstrap buildx environment: %v", err)
-		}
+	var randomBytes [8]byte
+	_, err := rand.Read(randomBytes[:])
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	return b
+	dgst2 := digest.Canonical.Encode(randomBytes[:])
+	name := "dalec_integration_test_" + dgst[:12] + dgst2
+
+	netHostTestEnvOnce.Do(func() {
+		netHostTestEnv = New().WithBuilder(name)
+		ctxT, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := netHostTestEnv.bootstrap(ctxT); err != nil {
+			cmd := exec.CommandContext(ctx, "docker", "buildx", "create", "--name", name, "--driver", "docker-container", "--driver-opt", "network=host", "--buildkitd-flags", "'--allow-insecure-entitlement=network.host'")
+			out, err := cmd.CombinedOutput()
+			assert.NilError(t, err, "failed to create buildx builder: %s", string(out))
+
+			t.Cleanup(func() {
+				netHostTestEnvCleanupOnce.Do(func() {
+					ctx := context.WithoutCancel(ctx)
+					cmd := exec.CommandContext(ctx, "docker", "buildx", "rm", name)
+					out, err := cmd.CombinedOutput()
+					assert.NilError(t, err, "failed to remove buildx builder: %s", string(out))
+				})
+			})
+
+			cmd = exec.CommandContext(ctx, "docker", "buildx", "inspect", name, "--bootstrap")
+			out, err = cmd.CombinedOutput()
+			assert.NilError(t, err, "failed to create buildx builder: %s", string(out))
+
+			netHostTestEnv = New().WithBuilder(name)
+			if err := netHostTestEnv.bootstrap(ctx); err != nil {
+				t.Fatalf("failed to bootstrap buildx environment: %v", err)
+			}
+		}
+
+	})
+
+	return netHostTestEnv
 }
 
 // clientForceDalecWithInput is a gwclient.Client that forces the solve request to use the main dalec frontend.
