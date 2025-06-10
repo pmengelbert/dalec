@@ -1,6 +1,7 @@
 package test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"text/template"
 	"time"
@@ -31,14 +33,9 @@ import (
 )
 
 const (
-	serverRoot     = "/git_server"
-	repoDir        = "/user/private"
-	repoMountpoint = serverRoot + repoDir
-
-	gomodGitHost  = "host.docker.internal"
-	localhostAddr = "127.0.0.1"
-
-	sourceName = "gitauth"
+	goVersion       = "1.23.5"
+	usernameRoot    = "root"
+	customScriptDir = "/tmp/dalec/internal/scripts"
 )
 
 // GitServicesAttributes are the basic pieces of information needed to host two git
@@ -64,12 +61,86 @@ type GitServicesAttributes struct {
 	HTTPPort string
 	// SSHPort is the port on which the ssh git server runs
 	SSHPort string
+	// AgentSock is the filesystem path of the socket exposed by the SSH agent
+	AgentSock string
 
 	// _tag is a private field and should not be accessed directly
 	_tag string
 }
 
-func (a *GitServicesAttributes) tag() string {
+type TestState struct {
+	t      *testing.T
+	ctx    context.Context
+	client gwclient.Client
+	attr   *GitServicesAttributes
+}
+
+type file struct {
+	location string
+	template string
+}
+
+type script struct {
+	basename string
+	template string
+}
+
+func (s *script) absPath() string {
+	return filepath.Join(customScriptDir, s.basename)
+}
+
+func (s *script) inject(t *testing.T, obj any) []byte {
+	f := file{
+		template: cleanScript(s.template),
+	}
+
+	return f.inject(t, obj)
+}
+
+func (f *file) inject(t *testing.T, obj any) []byte {
+	if obj == nil {
+		return []byte(f.template)
+	}
+
+	tmpl, err := template.New("depending go mod").Parse(f.template)
+	if err != nil {
+		t.Fatalf("could not parse template: %s", err)
+	}
+
+	type injector struct {
+		any
+		GoVersion string
+	}
+
+	var contents bytes.Buffer
+	tmpl.Execute(&contents, injector{
+		any:       obj,
+		GoVersion: goVersion,
+	})
+
+	return contents.Bytes()
+}
+
+func cleanScript(s string) string {
+	var b bytes.Buffer
+
+	tb := bytes.NewBuffer([]byte(s))
+	sc := bufio.NewScanner(tb)
+
+	for sc.Scan() {
+		t := sc.Text()
+		if strings.TrimSpace(t) == "" {
+			continue
+		}
+
+		b.WriteString(t)
+		b.WriteRune('\n')
+	}
+
+	return b.String()
+}
+
+func (a *GitServicesAttributes) Tag() string {
 	if a._tag != "" {
 		a._tag = identity.NewID()
 	}
@@ -83,6 +154,291 @@ func (a *GitServicesAttributes) repoAbsDir() string {
 
 func (a *GitServicesAttributes) inGitRepo(basename string) string {
 	return filepath.Join(a.repoAbsDir(), basename)
+}
+
+func TestGomodGitAuth2(t *testing.T) {
+	// 0. Test boilerplate
+	t.Parallel()
+	ctx := startTestSpan(baseCtx, t)
+	netHostBuildxEnv := testenv.NewWithNetHostBuildxInstance(ctx, t)
+	tmpDir := t.TempDir()
+
+	// 1. Determine basic information, like the host and port for the http and
+	// ssh services; also determine the socket file location for the ssh agent
+	netHostBuildxEnv.RunTest(ctx, t, func(ctx context.Context, client gwclient.Client) {
+		attr := GitServicesAttributes{
+			ServerRoot:      "/srv/git",
+			PublicRepoPath:  "username/public",
+			PrivateRepoPath: "username/private",
+			Host:            "host.docker.internal",
+			Addr:            "127.0.0.1",
+
+			// these are two distinct ports
+			HTTPPort:  findRandomAvailablePort(t),
+			SSHPort:   findRandomAvailablePort(t),
+			AgentSock: filepath.Join(tmpDir, "ssh.agent.sock"),
+		}
+
+		testState := TestState{
+			t:      t,
+			ctx:    ctx,
+			client: client,
+		}
+
+		// 1.5 Generate the go mod files
+		dependingModFile := file{
+			location: attr.inGitRepo("go.mod"),
+			template: `
+module {{ .Host }}/{{ .PublicRepoPath }}
+
+go {{ .GoVersion }}
+
+require {{ .Host }}/{{ .PrivateRepoPath }}.git {{ .Tag }}
+`,
+		}
+
+		const privateModfileTemplate = `
+module {{ .Host }}/user/private.git
+
+go {{ .GoVersion }}
+`
+
+		worker := worker(client)
+		initializedGitRepo := func() llb.StateOption {
+			return testState.initializedGitRepo(t, &attr, worker)
+		}
+
+		// 2. Set up the git repository
+		// 2a. Create the files
+		repo := llb.Scratch().
+			With(testState.customFile(dependingModFile)).
+			With(testState.customFile(file{
+				location: attr.inGitRepo("foo"),
+				template: "bar\n",
+			}))
+
+		// 3c. Create the hosting container by loading the git repo into it
+		gitHost := worker.With(hostedRepo(repo, attr.repoAbsDir()))
+
+		// gitHost := repo.With()
+
+		// 3. Set up SSH auth framework and run SSH git server
+		// 3a. Generate the keypair
+		pubkey, privkey := generateKeyPair(t)
+		// 3b. Load the private key into the SSH agent, and start the server
+		//     listening on the socket file
+		go startSSHAgent(t, ctx, privkey, attr.AgentSock)
+
+		// 3d. Load the authorized public key into the container
+		const githostUsername = "root"
+		sshGitHost := gitHost.With(authorizedKey(ctx, pubkey, githostUsername))
+
+		// 3e. Start the SSH server
+		startSSHServer(testState, sshGitHost)
+		// 3f. Wait for it to come online
+		//
+		// 4. Set up Git HTTP server and run it
+		// 4a. Start the git HTTP server
+		// 4b. Wait for it to come online
+
+		// 6. Generate the HTTP spec, and run the test with the secrets provided
+		//
+		// 7. Generate the SSH spec, and run the test with the auth socket provided
+	})
+}
+
+func newContainerWithRoot(t *testing.T, ctx context.Context, client gwclient.Client, st llb.State, attr *GitServicesAttributes) gwclient.Container {
+	ref := stateToRef(ctx, t, client, st)
+
+	cont, err := client.NewContainer(ctx, gwclient.NewContainerRequest{
+		Mounts: []gwclient.Mount{
+			{
+				Dest: "/",
+				Ref:  ref,
+			},
+		},
+		NetMode: pb.NetMode_HOST,
+		ExtraHosts: []*pb.HostIP{
+			{
+				Host: attr.Host,
+				IP:   attr.Addr,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("could not create ssh server container: %s", err)
+	}
+
+	return cont
+}
+
+func (ts *TestState) customFile(f file) llb.StateOption {
+	dir := filepath.Dir(f.location)
+
+	return func(s llb.State) llb.State {
+		return s.File(
+			llb.Mkdir(dir, 0o755, llb.WithParents(true)).
+				Mkfile(f.location, 0o644, f.inject(ts.t, ts.attr)),
+		)
+	}
+}
+
+func (ts *TestState) customScript(s script) llb.StateOption {
+	dir := customScriptDir
+	absPath := filepath.Join(dir, s.basename)
+
+	return func(st llb.State) llb.State {
+		return st.File(
+			llb.Mkdir(dir, 0o755, llb.WithParents(true)).
+				Mkfile(absPath, 0o755, s.inject(ts.t, ts.attr)),
+		)
+	}
+}
+
+// startSSHServer starts an sshd instance in a container hosting the git repo.
+// It runs asynchonously and checks the connection after starting the server.
+func startSSHServer(ts TestState, gitHost llb.State, attr *GitServicesAttributes) {
+	t := ts.t
+	ctx := ts.ctx
+	client := ts.client
+
+	const (
+		serverScriptName = "start_ssh_server.sh"
+		waitScriptName   = "wait.sh"
+	)
+	serverScript := script{
+		basename: "start_ssh_server.sh",
+		template: `
+            #!/usr/bin/env sh
+            set -ex
+            ssh-keygen -A
+            exec /usr/sbin/sshd -o PermitRootLogin=yes -p {{ .Port }} -D
+        `,
+	}
+
+	// serverScript := injectTemplate(t, scriptTemplate, attr)
+
+	// This script attempts to connect to the ssh server. The `nc -z` flag
+	// discconnects and exits with status 0 if a successful connection is made.
+	// `nc -w5` gives up and exits with status 1 after a 5-second timeout.
+	waitScript := script{
+		basename: "wait_for_ssh.sh",
+		template: `
+            #!/usr/bin/env sh
+            while ! nc -zw5 "$ADDR" "$SSH_PORT"; do
+                sleep 0.1
+            done
+`,
+	}
+
+	scriptDir := llb.Scratch().
+		With(ts.customScript(serverScript)).
+		With(ts.customScript())
+
+	cont, err := client.NewContainer(ctx, gwclient.NewContainerRequest{
+		Mounts: []gwclient.Mount{
+			{
+				Dest: "/",
+				Ref:  stateToRef(ts, gitHost),
+			},
+			//TODO double check that this works. I'm assuming it will with an overlay mount
+			{
+				Dest: customScriptDir,
+				Ref:  stateToRef(ts, scriptDir),
+			},
+		},
+		NetMode: pb.NetMode_HOST,
+		ExtraHosts: []*pb.HostIP{
+			{
+				Host: attr.Host,
+				IP:   attr.Addr,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("could not create ssh server container: %s", err)
+	}
+
+	env := getEnv(ts, gitHost, "HOST="+attr.Host, "SSH_PORT="+attr.SSHPort)
+	cp, err := cont.Start(ctx, gwclient.StartRequest{
+		Args:   []string{scriptAbsPath},
+		Env:    env,
+		Stdin:  os.Stdin,
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+	})
+	if err != nil {
+		t.Fatalf("could not start ssh server container: %s", err)
+	}
+
+	go func() {
+		if err := cp.Wait(); err != nil {
+			t.Logf("error running ssh sever container: %s", err)
+		}
+	}()
+
+	t.Log("waiting for ssh server to come online")
+	ctxT, cancel := context.WithTimeout(ctx, time.Second*20)
+	defer cancel()
+
+	untilConnected, err := cont.Start(ctxT, gwclient.StartRequest{
+		Env: env,
+		Args: []string{
+			"sh", "-c", waitScript,
+		},
+	})
+	if err != nil {
+		t.Fatalf("could not check progress of git server: %s", err)
+	}
+
+	if err := untilConnected.Wait(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Could not start git server: %s", err)
+		}
+
+		t.Fatalf("could not check progress of git server: %s", err)
+	}
+
+	t.Logf("ssh server is online")
+
+}
+
+func getEnv(ts TestState, st llb.State, extra ...string) []string {
+	env, err := st.Env(ts.ctx)
+	if err != nil {
+		ts.t.Logf("unable to copy env: %s", err)
+	}
+
+	return append(env.ToArray(), extra...)
+}
+
+func authorizedKey(ctx context.Context, pubkey ssh.PublicKey, username string) llb.StateOption {
+	dir := filepath.Join("home", username)
+	if username == usernameRoot {
+		dir = "/root"
+	}
+	dir = filepath.Join(dir, ".ssh")
+
+	const basename = "authorized_keys"
+	absPath := filepath.Join(dir, basename)
+
+	pubkeyData := ssh.MarshalAuthorizedKey(pubkey)
+
+	return func(s llb.State) llb.State {
+		return s.File(
+			llb.Mkdir(dir, 0o700, llb.WithParents(true)).
+				Mkfile(absPath, 0o600, pubkeyData),
+		)
+	}
+}
+
+func hostedRepo(repo llb.State, mountpoint string) llb.StateOption {
+	return func(worker llb.State) llb.State {
+		return worker.File(
+			llb.Mkdir(mountpoint, 0o755, llb.WithParents(true)).
+				Copy(repo, "/", mountpoint),
+		)
+	}
 }
 
 type gomodGitAuthTestConfig struct {
@@ -135,78 +491,101 @@ func WithPort(s string) func(*gomodGitAuthTestConfig) {
 	}
 }
 
-func TestGomodGitAuth2(t *testing.T) {
-	// 1. Determine basic information, like the host and port for the http and
-	// ssh services; also determine the socket file location for the ssh agent
-
-	attr := GitServicesAttributes{
-		ServerRoot:      "/srv/git",
-		PublicRepoPath:  "username/public",
-		PrivateRepoPath: "username/private",
-		Host:            "host.docker.internal",
-		Addr:            "127.0.0.1",
-
-		// these are two distinct ports
-		HTTPPort: findRandomAvailablePort(t),
-		SSHPort:  findRandomAvailablePort(t),
+func injectTemplate(t *testing.T, tp string, attr *GitServicesAttributes) []byte {
+	tmpl, err := template.New("depending go mod").Parse(tp)
+	if err != nil {
+		t.Fatalf("could not parse go mod template: %s", err)
 	}
 
-	// 1.5 Generate the go mod files
-	const dependingModfileTemplate = `
-module {{ .Host }}/{{ .PublicRepoPath }}
-
-go {{ .GoVersion }}
-
-require {{ .Host }}/{{ .PrivateRepoPath }}.git {{ .Tag }}
-`
-
-	const dependentModfileTemplate = `
-module {{ .Host }}/user/private.git
-
-go {{ .GoVersion }}
-`
-
-	injectTemplate := func() []byte {
-		tmpl, err := template.New("depending go mod").Parse(dependingModfileTemplate)
-		if err != nil {
-			t.Fatalf("could not parse go mod template: %s", err)
-		}
-
-		var gomodContents bytes.Buffer
-		tmpl.Execute(&gomodContents, struct{ Host, Tag string }{
-			Host: cfg.host,
-			Tag:  cfg.tag,
-		})
-
-		return gomodContents.Bytes()
+	type injector struct {
+		GitServicesAttributes
+		GoVersion string
 	}
 
-	// 2. Set up the git repository
-	// 2a. Create the files
-	repo := llb.Scratch().File(
-		llb.Mkdir(a.privateRepoPath, 0o644, llb.WithParents(true)).
-			Mkfile(a.inGitRepo("go.mod")),
-	)
+	if attr == nil {
+		t.Fatalf("attributes struct was nil: %#v", attr)
+	}
 
-	// 2b. Initialize the git repo
+	var gomodContents bytes.Buffer
+	tmpl.Execute(&gomodContents, injector{
+		GitServicesAttributes: *attr,
+		GoVersion:             goVersion,
+	})
 
-	// 3. Set up SSH auth framework and run SSH git server
-	// 3a. Generate the keypair
-	// 3b. Load the private key into the SSH agent, and start the server
-	//     listening on the socket file
-	// 3c. Create the hosting container, and load the authorized public key into it
-	// 3d. Start the SSH server
-	// 3e. Wait for it to come online
-	//
-	// 4. Set up Git HTTP server and run it
-	// 4a. Start the git HTTP server
-	// 4b. Wait for it to come online
+	return gomodContents.Bytes()
+}
 
-	// 5. Bootstrap the worker (requires client)
-	//
-	// 6. Generate the HTTP spec, and run the test with the secrets provided
-	//
-	// 7. Generate the SSH spec, and run the test with the auth socket provided
+func (ts *TestState) mountScript(s script) dalec.RunOptFunc {
+	scriptDir := customScriptDir
+	st := llb.Scratch().With(ts.customScript(s))
+
+	return func(ei *llb.ExecInfo) {
+		llb.AddMount(scriptDir, st).SetRunOption(ei)
+	}
+}
+
+// `runScript` is a replacement for `llb.State.Run(...)`. It mounts the
+// specified script in the custom script directory, then generates the llb to
+// run the script on `worker`.
+func (ts *TestState) runScriptOn(worker llb.State, s script, runopts ...llb.RunOption) llb.ExecState {
+	o := []llb.RunOption{
+		llb.Args([]string{s.absPath()}),
+		ts.mountScript(s),
+	}
+
+	o = append(o, runopts...)
+	return worker.Run(o...)
+}
+
+// initializedGitRepo returns a stateOption that uses `worker` to create an
+// initialized git repository from the base state.
+func (ts *TestState) initializedGitRepo(worker llb.State) llb.StateOption {
+	attr := ts.attr
+
+	repoScript := script{
+		basename: "git_init.sh",
+		template: `
+            #!/usr/bin/env sh
+
+            set -ex
+            export GIT_CONFIG_NOGLOBAL=true
+            git init
+            git config user.name foo
+            git config user.email foo@bar.com
+
+            git add -A
+            git commit -m commit --no-gpg-sign
+            git tag {{ .Tag }}
+`,
+	}
+
+	return func(repo llb.State) llb.State {
+		worker = worker.Dir(attr.PrivateRepoPath)
+
+		return ts.runScriptOn(worker, repoScript).
+			AddMount(attr.repoAbsDir(), llb.Scratch())
+	}
+}
+
+func startSSHAgent(t *testing.T, ctx context.Context, privkey crypto.PrivateKey, sockAddr string) {
+	kr := agent.NewKeyring()
+	kr.Add(agent.AddedKey{
+		PrivateKey: privkey,
+	})
+
+	listener, err := net.Listen("unix", sockAddr)
+	if err != nil {
+		t.Fatalf("can't listen on unix socket: %s", err)
+	}
+
+	c, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("listener.Accept: %s", err)
+	}
+
+	if err := agent.ServeAgent(kr, c); err != nil {
+		t.Fatalf("cannot serve agent: %s", err)
+	}
 }
 
 func TestGomodGitAuth(t *testing.T) {
@@ -275,18 +654,6 @@ func (cfg *gomodGitAuthTestConfig) runSSHServer(t *testing.T, ctx context.Contex
 		return
 	}
 }
-
-const initGitRepoScriptTemplate = `
-set -ex
-export GIT_CONFIG_NOGLOBAL=true
-git init
-git config user.name foo
-git config user.email foo@bar.com
-
-git add -A
-git commit -m commit --no-gpg-sign
-git tag {{ .Tag }}
-`
 
 func (cfg *gomodGitAuthTestConfig) runGitServer(t *testing.T, ctx context.Context, client gwclient.Client) {
 	repo := cfg.createDependentModule()
@@ -692,6 +1059,20 @@ require %[1]s/user/private.git %[2]s
 	}, testenv.WithHostNetworking, testenv.WithSSHSocket(sshID, sockfile))
 }
 
+func generateKeyPair(t *testing.T) (ssh.PublicKey, crypto.PrivateKey) {
+	u, privkey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("could not generate ssh keypair: %s", err)
+	}
+
+	pubkey, err := ssh.NewPublicKey(u)
+	if err != nil {
+		t.Fatalf("could not parse ssh public key: %s", err)
+	}
+
+	return pubkey, privkey
+}
+
 // Returns pubkey already marshaled for use in ssh server
 func runSSHAgent(ctx context.Context, t *testing.T, sockfile string) ([]byte, []byte) {
 	pubkey, privkey, err := ed25519.GenerateKey(rand.Reader)
@@ -868,6 +1249,12 @@ func getDirName(ctx context.Context, t *testing.T, res *gwclient.Result, base, d
 	return stats[0].Path
 }
 
+func worker(c gwclient.Client) llb.State {
+	worker := llb.Image("alpine:latest", llb.Platform(ocispecs.Platform{Architecture: runtime.GOARCH, OS: "linux"}), llb.WithMetaResolver(c)).
+		Run(llb.Shlex("apk add --no-cache go git ca-certificates patch openssh netcat-openbsd")).Root()
+	return worker
+}
+
 func (cfg *gomodGitAuthTestConfig) initGomodWorker(c gwclient.Client) llb.State {
 	worker := llb.Image("alpine:latest", llb.Platform(ocispecs.Platform{Architecture: runtime.GOARCH, OS: "linux"}), llb.WithMetaResolver(c)).
 		Run(llb.Shlex("apk add --no-cache go git ca-certificates patch openssh netcat-openbsd")).Root()
@@ -1006,13 +1393,15 @@ done
 	return nil
 }
 
-func stateToRef(ctx context.Context, t *testing.T, client gwclient.Client, st llb.State) gwclient.Reference {
-	def, err := st.Marshal(ctx)
+func stateToRef(ts TestState, st llb.State) gwclient.Reference {
+	t := ts.t
+
+	def, err := st.Marshal(ts.ctx)
 	if err != nil {
 		t.Fatalf("could not marshal git repo llb: %s", err)
 	}
 
-	res, err := client.Solve(ctx, gwclient.SolveRequest{Definition: def.ToPB()})
+	res, err := ts.client.Solve(ts.ctx, gwclient.SolveRequest{Definition: def.ToPB()})
 	if err != nil {
 		t.Fatalf("could not solve git repo llb %s", err)
 	}
