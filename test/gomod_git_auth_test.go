@@ -3,6 +3,7 @@ package test
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
@@ -14,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"testing"
+	"text/template"
 	"time"
 
 	"github.com/Azure/dalec"
@@ -33,26 +35,460 @@ const (
 	repoDir        = "/user/private"
 	repoMountpoint = serverRoot + repoDir
 
-	host = "host.docker.internal"
-	addr = "127.0.0.1"
+	gomodGitHost  = "host.docker.internal"
+	localhostAddr = "127.0.0.1"
 
 	sourceName = "gitauth"
 )
+
+// GitServicesAttributes are the basic pieces of information needed to host two git
+// servers, one via SSH and one via HTTP
+type GitServicesAttributes struct {
+	// ServerRoot is the root filesystem path of the git server. URL paths
+	// refer to repositories relative to this root
+	ServerRoot string
+	// PrivateRepoPath is the filesystem path, relative to `serverRoot`, where
+	// the private git repository is hosted
+	PrivateRepoPath string
+	// privateRepoPath is the URI path in the name of the public go module;
+	// this public go module has a private dependency on the repo at
+	// `privateRepoPath`
+	PublicRepoPath string
+
+	// Host is the hostname of the git server
+	Host string
+	// Addr is the IPv4 address to which the hostname resolves
+	Addr string
+
+	// HTTPPort is the port on which the http git server runs
+	HTTPPort string
+	// SSHPort is the port on which the ssh git server runs
+	SSHPort string
+
+	// _tag is a private field and should not be accessed directly
+	_tag string
+}
+
+func (a *GitServicesAttributes) tag() string {
+	if a._tag != "" {
+		a._tag = identity.NewID()
+	}
+
+	return a._tag
+}
+
+func (a *GitServicesAttributes) repoAbsDir() string {
+	return filepath.Join(a.ServerRoot, a.PrivateRepoPath)
+}
+
+func (a *GitServicesAttributes) inGitRepo(basename string) string {
+	return filepath.Join(a.repoAbsDir(), basename)
+}
+
+type gomodGitAuthTestConfig struct {
+	attr GitServicesAttributes
+
+	rrunSSHAgent  func(t *testing.T, ctx context.Context, sockfile string)
+	rrunSSHServer func(t *testing.T)
+	rrunGitServer func(t *testing.T)
+
+	dependingGoDotMod []byte
+	dependentGoDotMod []byte
+
+	pubkey  ssh.PublicKey
+	privkey crypto.PrivateKey
+
+	worker llb.State
+}
+
+func NewGomodGitAuthTestConfig(opts ...func(*gomodGitAuthTestConfig)) gomodGitAuthTestConfig {
+	var cfg gomodGitAuthTestConfig
+
+	for _, f := range opts {
+		f(&cfg)
+	}
+
+	return cfg
+}
+
+func WithServerRoot(s string) func(*gomodGitAuthTestConfig) {
+	return func(cfg *gomodGitAuthTestConfig) {
+		cfg.serverRoot = s
+	}
+}
+
+func WithRepoDir(s string) func(*gomodGitAuthTestConfig) {
+	return func(cfg *gomodGitAuthTestConfig) {
+		cfg.repoDir = s
+	}
+}
+
+func WithHost(s string) func(*gomodGitAuthTestConfig) {
+	return func(cfg *gomodGitAuthTestConfig) {
+		cfg.host = s
+	}
+}
+
+func WithPort(s string) func(*gomodGitAuthTestConfig) {
+	return func(cfg *gomodGitAuthTestConfig) {
+		cfg.port = s
+	}
+}
+
+func TestGomodGitAuth2(t *testing.T) {
+	// 1. Determine basic information, like the host and port for the http and
+	// ssh services; also determine the socket file location for the ssh agent
+
+	attr := GitServicesAttributes{
+		ServerRoot:      "/srv/git",
+		PublicRepoPath:  "username/public",
+		PrivateRepoPath: "username/private",
+		Host:            "host.docker.internal",
+		Addr:            "127.0.0.1",
+
+		// these are two distinct ports
+		HTTPPort: findRandomAvailablePort(t),
+		SSHPort:  findRandomAvailablePort(t),
+	}
+
+	// 1.5 Generate the go mod files
+	const dependingModfileTemplate = `
+module {{ .Host }}/{{ .PublicRepoPath }}
+
+go {{ .GoVersion }}
+
+require {{ .Host }}/{{ .PrivateRepoPath }}.git {{ .Tag }}
+`
+
+	const dependentModfileTemplate = `
+module {{ .Host }}/user/private.git
+
+go {{ .GoVersion }}
+`
+
+	injectTemplate := func() []byte {
+		tmpl, err := template.New("depending go mod").Parse(dependingModfileTemplate)
+		if err != nil {
+			t.Fatalf("could not parse go mod template: %s", err)
+		}
+
+		var gomodContents bytes.Buffer
+		tmpl.Execute(&gomodContents, struct{ Host, Tag string }{
+			Host: cfg.host,
+			Tag:  cfg.tag,
+		})
+
+		return gomodContents.Bytes()
+	}
+
+	// 2. Set up the git repository
+	// 2a. Create the files
+	repo := llb.Scratch().File(
+		llb.Mkdir(a.privateRepoPath, 0o644, llb.WithParents(true)).
+			Mkfile(a.inGitRepo("go.mod")),
+	)
+
+	// 2b. Initialize the git repo
+
+	// 3. Set up SSH auth framework and run SSH git server
+	// 3a. Generate the keypair
+	// 3b. Load the private key into the SSH agent, and start the server
+	//     listening on the socket file
+	// 3c. Create the hosting container, and load the authorized public key into it
+	// 3d. Start the SSH server
+	// 3e. Wait for it to come online
+	//
+	// 4. Set up Git HTTP server and run it
+	// 4a. Start the git HTTP server
+	// 4b. Wait for it to come online
+
+	// 5. Bootstrap the worker (requires client)
+	//
+	// 6. Generate the HTTP spec, and run the test with the secrets provided
+	//
+	// 7. Generate the SSH spec, and run the test with the auth socket provided
+}
 
 func TestGomodGitAuth(t *testing.T) {
 	t.Parallel()
 	ctx := startTestSpan(baseCtx, t)
 	netHostBuildxEnv := testenv.NewWithNetHostBuildxInstance(ctx, t)
+	httpPort := findRandomAvailablePort(t)
+	sshPort := findRandomAvailablePort(t)
+
+	cfg := gomodGitAuthTestConfig{
+		serverRoot: "/git_server",
+		repoDir:    "/user/private",
+		host:       "host.docker.internal",
+		addr:       "127.0.0.1",
+		sourceName: "gitauth",
+	}
+
+	spec := cfg.generateSpec()
 
 	t.Run("HTTPS", func(t *testing.T) {
+		netHostBuildxEnv.RunTest(ctx, t, func(ctx context.Context, client gwclient.Client) {
+			cfg := cfg
+			cfg.tag = identity.NewID()
+			cfg.port = httpPort
+			cfg.worker = cfg.initGomodWorker(client)
+			cfg.dependingGoDotMod = cfg.injectTemplate(t, dependingModfileTemplate)
+			cfg.dependentGoDotMod = cfg.injectTemplate(t, dependentModfileTemplate)
+
+			cfg.runGitServer(t, ctx, client)
+		}, testenv.WithSecrets(testenv.KeyVal{
+			K: "super-secret",
+			V: "value",
+		}), testenv.WithHostNetworking)
 		testGomodGitAuthHTTPS(t, ctx, netHostBuildxEnv)
 	})
 
 	t.Run("SSH", func(t *testing.T) {
+		netHostBuildxEnv.RunTest(ctx, t, func(ctx context.Context, client gwclient.Client) {
+			cfg := cfg
+			cfg.tag = identity.NewID()
+			cfg.port = sshPort
+			cfg.sshGitUser = "root"
+			cfg.sshID = "dalecssh"
+			cfg.worker = cfg.initGomodWorker(client)
+		}, testenv.WithSecrets(testenv.KeyVal{
+			K: "super-secret",
+			V: "value",
+		}), testenv.WithHostNetworking)
 		testGomodGitAuthSSH(t, ctx, netHostBuildxEnv)
 	})
 
 }
+
+func (cfg *gomodGitAuthTestConfig) repoMountpoint() string {
+	return fmt.Sprintf("%s%s", cfg.serverRoot, cfg.repoDir)
+}
+
+func (cfg *gomodGitAuthTestConfig) runSSHAgent(t *testing.T, ctx context.Context, client gwclient.Client) {
+	if cfg.sshID == "" {
+		return
+	}
+}
+
+func (cfg *gomodGitAuthTestConfig) runSSHServer(t *testing.T, ctx context.Context, client gwclient.Client) {
+	if cfg.sshID == "" {
+		return
+	}
+}
+
+const initGitRepoScriptTemplate = `
+set -ex
+export GIT_CONFIG_NOGLOBAL=true
+git init
+git config user.name foo
+git config user.email foo@bar.com
+
+git add -A
+git commit -m commit --no-gpg-sign
+git tag {{ .Tag }}
+`
+
+func (cfg *gomodGitAuthTestConfig) runGitServer(t *testing.T, ctx context.Context, client gwclient.Client) {
+	repo := cfg.createDependentModule()
+	script := string(cfg.injectTemplate(t, initGitRepoScriptTemplate))
+
+	cfg.worker = cfg.worker.Dir(cfg.repoMountpoint()).Run(
+		llb.AddMount(cfg.repoMountpoint(), repo),
+		dalec.ShArgs(script),
+	).Root()
+
+	dc, err := dockerui.NewClient(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gitServerProgramPtr, err := dc.MainContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gitServerProgramSt := *gitServerProgramPtr
+	gitServerBinSt := worker.Run(
+		dalec.ShArgs("cd /tmp/dalec/internal/dalec && go build -o /tmp/out/host ./test/cmd/git_repo"),
+		llb.AddMount("/tmp/dalec/internal/dalec", gitServerProgramSt),
+	).AddMount("/tmp/out", llb.Scratch())
+
+	workerRef := stateToRef(ctx, t, client, worker)
+	gitServerProgramRef := stateToRef(ctx, t, client, gitServerBinSt)
+
+	cont, err := client.NewContainer(ctx, gwclient.NewContainerRequest{
+		Mounts: []gwclient.Mount{
+			{
+				Dest:     "/",
+				Ref:      workerRef,
+				Readonly: true,
+			},
+			{
+				Dest:     "/git_repo",
+				Ref:      gitServerProgramRef,
+				Readonly: true,
+			},
+		},
+		NetMode: pb.NetMode_HOST,
+		ExtraHosts: []*pb.HostIP{
+			{
+				Host: gomodGitHost,
+				IP:   localhostAddr,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	env, err := worker.Env(ctx)
+	if err != nil {
+		t.Logf("unable to copy env: %s", err)
+	}
+
+	envArr := env.ToArray()
+	envArr = append(envArr, "HOST="+gomodGitHost, "ADDR="+localhostAddr, "PORT="+port)
+
+	cp, err := cont.Start(ctx, gwclient.StartRequest{
+		Args:      []string{"/git_repo/host", serverRoot, localhostAddr, port},
+		Env:       envArr,
+		SecretEnv: []*pb.SecretEnv{},
+		Stdin:     os.Stdin,
+		Stdout:    os.Stdout,
+		Stderr:    os.Stderr,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		if err := cp.Wait(); err != nil {
+			t.Logf("unexpected server error: %s", err)
+		}
+	}()
+
+	t.Log("waiting for git server to come online")
+	ctxT, cancel := context.WithTimeout(ctx, time.Second*20)
+	defer cancel()
+
+	// netcat's -z will return 0 if a connection can be made, 1 if not
+	// -w5 means timeout after 5 seconds
+	untilConnected, err := cont.Start(ctxT, gwclient.StartRequest{
+		Env: envArr,
+		Args: []string{
+			"sh", "-c", `
+while ! nc -zw5 "$ADDR" "$PORT"; do
+	sleep 0.1
+done
+			`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("could not check progress of git server: %s", err)
+	}
+
+	if err := untilConnected.Wait(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Could not start git server: %s", err)
+		}
+
+		t.Fatalf("could not check progress of git server: %s", err)
+	}
+
+	t.Logf("git server is online")
+
+	return nil
+}
+
+func (cfg *gomodGitAuthTestConfig) hostPort() string {
+	return fmt.Sprintf("%s:%s", cfg.host, cfg.port)
+}
+
+func (cfg *gomodGitAuthTestConfig) generateSpec() *dalec.Spec {
+	auth := map[string]dalec.GomodGitAuth{
+		cfg.hostPort(): {
+			Token: "super-secret",
+		},
+	}
+
+	if cfg.sshID != "" {
+		a := auth[cfg.hostPort()]
+		a.Token = ""
+		a.SSH = &dalec.GomodGitAuthSSH{
+			ID:       cfg.sshID,
+			Username: cfg.sshGitUser,
+		}
+		auth[cfg.hostPort()] = a
+	}
+
+	return &dalec.Spec{
+		Name: "gomod-git-auth",
+		Sources: map[string]dalec.Source{
+			cfg.sourceName: {
+				Inline: &dalec.SourceInline{
+					Dir: &dalec.SourceInlineDir{
+						Files: map[string]*dalec.SourceInlineFile{
+							"go.mod": {
+								Contents: string(cfg.dependingGoDotMod),
+							},
+						},
+					},
+				},
+				Generate: []*dalec.SourceGenerator{
+					{
+						Gomod: &dalec.GeneratorGomod{
+							Auth: auth,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func (cfg *gomodGitAuthTestConfig) createDependentModule() llb.State {
+	return llb.Scratch().
+		File(
+			llb.Mkdir(cfg.repoDir, 0o755, llb.WithParents(true))).
+		Dir(repoDir).
+		File(
+			llb.Mkfile("hello", 0o644, []byte("hello\n")).
+				Mkfile("go.mod", 0o644, cfg.dependentGoDotMod),
+		)
+}
+
+// func testGomodGitAuthGeneric(t *testing.T, ctx context.Context, buildEnv *testenv.BuildxEnv, auth dalec.GomodGitAuth) {
+// 	t.Parallel()
+// 	ctx = startTestSpan(ctx, t)
+// 	tag := identity.NewID()
+
+// 	dependingGomodFileContents := generateGoDotModFileContents(t, dependingModfileTemplate, tag)
+// 	port := getAvailablePort(t)
+// 	hostPort := fmt.Sprintf("%s:%s", gomodGitHost, port)
+
+// 	// spec :=
+// }
+
+func (cfg *gomodGitAuthTestConfig) injectTemplate(t *testing.T, tmplstr string) []byte {
+	tmpl, err := template.New("depending go mod").Parse(dependingModfileTemplate)
+	if err != nil {
+		t.Fatalf("could not parse go mod template: %s", err)
+	}
+
+	var gomodContents bytes.Buffer
+	tmpl.Execute(&gomodContents, struct{ Host, Tag string }{
+		Host: cfg.host,
+		Tag:  cfg.tag,
+	})
+
+	return gomodContents.Bytes()
+}
+
+// func gomodGitAuthTest(t *testing.T, parentCtx context.Context, buildEnv *testenv.BuildxEnv, spec *dalec.Spec) {
+// 	ctx := startTestSpan(parentCtx, t)
+// 	tag := identity.NewID()
+
+// }
 
 func testGomodGitAuthHTTPS(t *testing.T, parentCtx context.Context, buildEnv *testenv.BuildxEnv) {
 	t.Parallel()
@@ -60,14 +496,21 @@ func testGomodGitAuthHTTPS(t *testing.T, parentCtx context.Context, buildEnv *te
 	tag := identity.NewID()
 
 	buildEnv.RunTest(ctx, t, func(ctx context.Context, c gwclient.Client) {
-		const gomodFmt = "module %[1]s/user/public\n" +
-			"\n" +
-			"go 1.23.5\n" +
-			"\n" +
-			"require %[1]s/user/private.git %[2]s\n"
+		tmpl, err := template.New("depending go mod").Parse(dependingModfileTemplate)
+		if err != nil {
+			t.Fatalf("could not parse go mod template: %s", err)
+		}
 
-		gomodContents := fmt.Sprintf(gomodFmt, host, tag)
-		port := getAvailablePort(t)
+		var gomodContents bytes.Buffer
+		tmpl.Execute(&gomodContents, struct {
+			Host    string
+			Version string
+		}{
+			Host:    gomodGitHost,
+			Version: tag,
+		})
+
+		port := findRandomAvailablePort(t)
 
 		spec := &dalec.Spec{
 			Name: "gomod-git-auth",
@@ -77,7 +520,7 @@ func testGomodGitAuthHTTPS(t *testing.T, parentCtx context.Context, buildEnv *te
 						Dir: &dalec.SourceInlineDir{
 							Files: map[string]*dalec.SourceInlineFile{
 								"go.mod": {
-									Contents: gomodContents,
+									Contents: gomodContents.String(),
 								},
 							},
 						},
@@ -86,7 +529,7 @@ func testGomodGitAuthHTTPS(t *testing.T, parentCtx context.Context, buildEnv *te
 						{
 							Gomod: &dalec.GeneratorGomod{
 								Auth: map[string]dalec.GomodGitAuth{
-									fmt.Sprintf("%s:%s", host, port): {
+									fmt.Sprintf("%s:%s", gomodGitHost, port): {
 										Token: "super-secret",
 									},
 								},
@@ -97,20 +540,15 @@ func testGomodGitAuthHTTPS(t *testing.T, parentCtx context.Context, buildEnv *te
 			},
 		}
 
+		gomodContents.Reset()
 		// Private git repo
-		modFile := fmt.Sprintf("module %s/user/private.git\n"+
-			"\n"+
-			"\n"+
-			"go 1.23.5\n", host)
-
-		repo := llb.Scratch().
-			File(
-				llb.Mkdir(repoDir, 0o755, llb.WithParents(true))).
-			Dir(repoDir).
-			File(
-				llb.Mkfile("hello", 0o644, []byte("hello\n")).
-					Mkfile("go.mod", 0o644, []byte(modFile)),
-			)
+		modFileTmpl, err := template.New("dependent go mod template").Parse(dependentModfileTemplate)
+		if err != nil {
+			t.Fatalf("could not parse go mod template: %s", err)
+		}
+		modFileTmpl.Execute(&gomodContents, struct{ Host string }{Host: gomodGitHost})
+		worker := initGomodWorker(c, gomodGitHost, port, nil)
+		repo := newFunction(repoDir, gomodContents, worker, tag)
 
 		if err := runGitServer(ctx, t, c, repo, port, tag); err != nil {
 			t.Fatal(err)
@@ -119,11 +557,11 @@ func testGomodGitAuthHTTPS(t *testing.T, parentCtx context.Context, buildEnv *te
 		sr := newSolveRequest(
 			withBuildTarget("debug/gomods"),
 			withSpec(ctx, t, spec),
-			withExtraHost(host, addr),
-			withBuildContext(ctx, t, "gomod-worker", initGomodWorker(c, host, port, nil)),
+			withExtraHost(gomodGitHost, localhostAddr),
+			withBuildContext(ctx, t, "gomod-worker", initGomodWorker(c, gomodGitHost, port, nil)),
 		)
 
-		const outDirBase = host + "/user"
+		const outDirBase = gomodGitHost + "/user"
 		res := solveT(ctx, t, c, sr)
 		modDir := getDirName(ctx, t, res, outDirBase, "private.git@*")
 
@@ -133,6 +571,34 @@ func testGomodGitAuthHTTPS(t *testing.T, parentCtx context.Context, buildEnv *te
 		K: "super-secret",
 		V: "value",
 	}), testenv.WithHostNetworking)
+}
+
+func newFunction(repoDir string, gomodContents bytes.Buffer, worker, repoContents llb.State, tag string) llb.State {
+	repo := llb.Scratch().
+		File(
+			llb.Mkdir(repoDir, 0o755, llb.WithParents(true))).
+		Dir(repoDir).
+		File(
+			llb.Mkfile("hello", 0o644, []byte("hello\n")).
+				Mkfile("go.mod", 0o644, gomodContents.Bytes()),
+		)
+
+	worker = worker.File(llb.Copy(repo, "/", serverRoot))
+	return worker.Dir(repoMountpoint).Run(
+		llb.AddMount(serverRoot, repo),
+		dalec.ShArgsf(`
+set -ex
+export GIT_CONFIG_NOGLOBAL=true
+git init
+git config user.name foo
+git config user.email foo@bar.com
+
+git add -A
+git commit -m commit --no-gpg-sign
+git tag %s
+`,
+			tag)).
+		AddMount(repoMountpoint, llb.Scratch())
 }
 
 func testGomodGitAuthSSH(t *testing.T, parentCtx context.Context, buildxEnv *testenv.BuildxEnv) {
@@ -149,7 +615,9 @@ func testGomodGitAuthSSH(t *testing.T, parentCtx context.Context, buildxEnv *tes
 	pubkeyBytes, privkeyBytes := runSSHAgent(ctx, t, sockfile)
 
 	buildxEnv.RunTest(ctx, t, func(ctx context.Context, c gwclient.Client) {
-		defer os.RemoveAll(sockfile)
+		t.Cleanup(func() {
+			_ = os.RemoveAll(sockfile)
+		})
 		const gomodFmt = `module %[1]s/user/public
 
 go 1.23.5
@@ -157,8 +625,8 @@ go 1.23.5
 require %[1]s/user/private.git %[2]s
 `
 
-		gomodContents := fmt.Sprintf(gomodFmt, host, tag)
-		port := getAvailablePort(t)
+		gomodContents := fmt.Sprintf(gomodFmt, gomodGitHost, tag)
+		port := findRandomAvailablePort(t)
 
 		spec := &dalec.Spec{
 			Name: "gomod-git-auth",
@@ -177,7 +645,7 @@ require %[1]s/user/private.git %[2]s
 						{
 							Gomod: &dalec.GeneratorGomod{
 								Auth: map[string]dalec.GomodGitAuth{
-									fmt.Sprintf("%s:%s", host, port): {
+									fmt.Sprintf("%s:%s", gomodGitHost, port): {
 										SSH: &dalec.GomodGitAuthSSH{
 											ID:       sshID,
 											Username: gituser,
@@ -195,7 +663,7 @@ require %[1]s/user/private.git %[2]s
 		modFile := fmt.Sprintf("module %s/user/private.git\n"+
 			"\n"+
 			"\n"+
-			"go 1.23.5\n", host)
+			"go 1.23.5\n", gomodGitHost)
 
 		repo := llb.Scratch().
 			File(
@@ -211,11 +679,11 @@ require %[1]s/user/private.git %[2]s
 		sr := newSolveRequest(
 			withBuildTarget("debug/gomods"),
 			withSpec(ctx, t, spec),
-			withExtraHost(host, addr),
-			withBuildContext(ctx, t, "gomod-worker", initGomodWorker(c, host, port, privkeyBytes)),
+			withExtraHost(gomodGitHost, localhostAddr),
+			withBuildContext(ctx, t, "gomod-worker", initGomodWorker(c, gomodGitHost, port, privkeyBytes)),
 		)
 
-		const outDirBase = host + "/user"
+		const outDirBase = gomodGitHost + "/user"
 		res := solveT(ctx, t, c, sr)
 		modDir := getDirName(ctx, t, res, outDirBase, "private.git@*")
 
@@ -271,7 +739,7 @@ func runSSHAgent(ctx context.Context, t *testing.T, sockfile string) ([]byte, []
 }
 
 func runSSHServer(ctx context.Context, t *testing.T, client gwclient.Client, repo llb.State, port, tag string, pubkey []byte) {
-	worker := initGomodWorker(client, host, port, nil)
+	worker := initGomodWorker(client, gomodGitHost, port, nil)
 	worker = worker.File(llb.Copy(repo, "/", serverRoot))
 	gitDir := worker.Dir(repoMountpoint).Run(dalec.ShArgsf(`set -ex
 export GIT_CONFIG_NOGLOBAL=true
@@ -310,8 +778,8 @@ git init --bare
 		NetMode: pb.NetMode_HOST,
 		ExtraHosts: []*pb.HostIP{
 			{
-				Host: host,
-				IP:   addr,
+				Host: gomodGitHost,
+				IP:   localhostAddr,
 			},
 		},
 		Constraints: &pb.WorkerConstraints{
@@ -350,7 +818,7 @@ git init --bare
 	ctxT, cancel := context.WithTimeout(ctx, time.Second*20)
 	defer cancel()
 
-	envArr = append(envArr, "HOST="+host, "ADDR="+addr, "PORT="+port)
+	envArr = append(envArr, "HOST="+gomodGitHost, "ADDR="+localhostAddr, "PORT="+port)
 
 	untilConnected, err := cont.Start(ctxT, gwclient.StartRequest{
 		Env: envArr,
@@ -400,20 +868,16 @@ func getDirName(ctx context.Context, t *testing.T, res *gwclient.Result, base, d
 	return stats[0].Path
 }
 
-func initGomodWorker(c gwclient.Client, host, port string, privKeyBytes []byte) llb.State {
+func (cfg *gomodGitAuthTestConfig) initGomodWorker(c gwclient.Client) llb.State {
 	worker := llb.Image("alpine:latest", llb.Platform(ocispecs.Platform{Architecture: runtime.GOARCH, OS: "linux"}), llb.WithMetaResolver(c)).
 		Run(llb.Shlex("apk add --no-cache go git ca-certificates patch openssh netcat-openbsd")).Root()
-
-	if privKeyBytes != nil {
-		worker = worker.File(llb.Mkdir("/root/.ssh", 0o700, llb.WithParents(true)).Mkfile("/root/.ssh/id_ed25519", 0o600, privKeyBytes))
-	}
 
 	run := func(cmd string) {
 		// tell git to use the port along with the host
 		worker = worker.Run(
 			dalec.ShArgs(cmd),
-			llb.AddEnv("HOST", host),
-			llb.AddEnv("PORT", port),
+			llb.AddEnv("HOST", cfg.host),
+			llb.AddEnv("PORT", cfg.port),
 		).Root()
 	}
 
@@ -425,7 +889,7 @@ func initGomodWorker(c gwclient.Client, host, port string, privKeyBytes []byte) 
 
 func runGitServer(ctx context.Context, t *testing.T, client gwclient.Client, repo llb.State, port, tag string) error {
 
-	worker := initGomodWorker(client, host, port, nil)
+	worker := initGomodWorker(client, gomodGitHost, port, nil)
 	worker = worker.File(llb.Copy(repo, "/", serverRoot))
 	worker = worker.Dir(repoMountpoint).Run(dalec.ShArgsf(`
 set -ex
@@ -474,8 +938,8 @@ git tag %s
 		NetMode: pb.NetMode_HOST,
 		ExtraHosts: []*pb.HostIP{
 			{
-				Host: host,
-				IP:   addr,
+				Host: gomodGitHost,
+				IP:   localhostAddr,
 			},
 		},
 	})
@@ -489,10 +953,10 @@ git tag %s
 	}
 
 	envArr := env.ToArray()
-	envArr = append(envArr, "HOST="+host, "ADDR="+addr, "PORT="+port)
+	envArr = append(envArr, "HOST="+gomodGitHost, "ADDR="+localhostAddr, "PORT="+port)
 
 	cp, err := cont.Start(ctx, gwclient.StartRequest{
-		Args:      []string{"/git_repo/host", serverRoot, addr, port},
+		Args:      []string{"/git_repo/host", serverRoot, localhostAddr, port},
 		Env:       envArr,
 		SecretEnv: []*pb.SecretEnv{},
 		Stdin:     os.Stdin,
@@ -560,7 +1024,7 @@ func stateToRef(ctx context.Context, t *testing.T, client gwclient.Client, st ll
 	return ref
 }
 
-func getAvailablePort(t *testing.T) string {
+func findRandomAvailablePort(t *testing.T) string {
 	addr, err := net.ResolveTCPAddr("tcp", ":0")
 	if err != nil {
 		t.Fatal(err)
