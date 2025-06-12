@@ -40,6 +40,181 @@ const (
 	waitOnlineTimeout = 20 * time.Second
 )
 
+func TestGomodGitAuth(t *testing.T) {
+	// 0. Test boilerplate
+	t.Parallel()
+	ctx := startTestSpan(baseCtx, t)
+	netHostBuildxEnv := testenv.NewWithNetHostBuildxInstance(ctx, t)
+	tmpDir := t.TempDir()
+	sshID := "dalecssh"
+
+	const sourcename = "gitauth"
+
+	attr := GitServicesAttributes{
+		ServerRoot:             "/",
+		PrivateRepoPath:        "username/private",
+		PublicRepoPath:         "username/public",
+		HTTPServerPath:         "/usr/local/bin/git_http_server",
+		GitUsername:            "git",
+		Host:                   "host.docker.internal",
+		Addr:                   "127.0.0.1",
+		HTTPPort:               findRandomAvailablePort(t),
+		SSHPort:                findRandomAvailablePort(t),
+		AgentSock:              filepath.Join(tmpDir, "ssh.agent.sock"),
+		HTTPServerBuildDir:     "/tmp/dalec/internal/dalec_coderoot",
+		HTTPServeCodeLocalPath: "./test/cmd/git_repo",
+		OutDir:                 "/tmp/dalec/internal/output",
+	}
+
+	pubkey, privkey := generateKeyPair(t)
+	agentErrChan := startSSHAgent(t, privkey, attr.AgentSock)
+
+	// 1. Determine basic information, like the host and port for the http and
+	// ssh services; also determine the socket file location for the ssh agent
+	netHostBuildxEnv.RunTest(ctx, t, func(ctx context.Context, client gwclient.Client) {
+
+		testState := TestState{
+			t:      t,
+			ctx:    ctx,
+			client: client,
+			attr:   &attr,
+		}
+
+		// 1.5 Generate the go mod files
+		dependingModfile := file{
+			template: `
+module {{ .Host }}/{{ .PublicRepoPath }}
+
+go {{ .GoVersion }}
+
+require {{ .Host }}/{{ .PrivateRepoPath }}.git {{ .Tag }}
+`,
+		}
+
+		dependentModfile := file{
+			location: "go.mod",
+			template: `
+module {{ .Host }}/{{ .PrivateRepoPath }}.git
+
+go {{ .GoVersion }}
+            `,
+		}
+
+		worker := worker(client)
+		// 2. Set up the git repository
+		// 2a. Create the files
+		repo := llb.Scratch().
+			With(testState.customFile(dependentModfile)).
+			With(testState.customFile(file{
+				location: "foo",
+				template: "bar\n",
+			})).
+			With(testState.initializeGitRepo(worker))
+
+		// 3c. Create the hosting container by loading the git repo into it
+		gitHost := worker.With(hostedRepo(repo, attr.RepoAbsDir()))
+
+		dependingModfileContents := string(dependingModfile.inject(t, &attr))
+		t.Run("SSH", func(t *testing.T) {
+			testState := testState
+			testState.t = t
+
+			const githostUsername = "root"
+			sshGitHost := gitHost
+			_ = pubkey
+			sshGitHost = gitHost.
+				With(authorizedKey(pubkey, "/root")).
+				With(bareRepo(repo, attr.RepoAbsDir()))
+
+			sshErrChan := testState.startSSHServer(sshGitHost)
+
+			auth := dalec.GomodGitAuth{
+				SSH: &dalec.GomodGitAuthSSH{
+					ID:       sshID,
+					Username: githostUsername,
+				},
+			}
+
+			spec := testState.generateSpec(auth, dependingModfileContents)
+			sr := newSolveRequest(
+				withBuildTarget("debug/gomods"),
+				withSpec(ctx, t, spec),
+				withExtraHost(testState.attr.Host, testState.attr.Addr),
+			)
+
+			solveResultChan := make(chan *gwclient.Result)
+			solveErrChan := make(chan error)
+
+			solveTCh(ctx, t, testState.client, sr, solveResultChan, solveErrChan)
+
+			var res *gwclient.Result
+			select {
+			case err := <-agentErrChan:
+				t.Fatalf("ssh agent unexpededly failed: %s", err)
+			case err := <-sshErrChan:
+				t.Fatalf("ssh server unexpededly failed: %s", err)
+			case err := <-solveErrChan:
+				t.Fatalf("solve failed: %s", err)
+			case r := <-solveResultChan:
+				res = r
+			}
+
+			outDirBase := filepath.Join(attr.Host, filepath.Dir(attr.PrivateRepoPath))
+			modDir := getDirName(ctx, t, res, outDirBase, "private.git@*")
+			filename := filepath.Join(outDirBase, modDir, "foo")
+			checkFile(ctx, t, filename, res, []byte("bar\n"))
+		})
+
+		// 3d. Load the authorized public key into the container
+
+		// 3e. Start the SSH server
+
+		t.Run("HTTP", func(t *testing.T) {
+			testState := testState
+			testState.t = t
+
+			httpGitHost := gitHost.With(testState.updateGitconfig())
+			httpErrChan := testState.startHTTPServer(httpGitHost)
+
+			auth := dalec.GomodGitAuth{
+				Token: "super-secret",
+			}
+
+			spec := testState.generateSpec(auth, dependingModfileContents)
+
+			sr := newSolveRequest(
+				withBuildTarget("debug/gomods"),
+				withSpec(ctx, t, spec),
+				withExtraHost(testState.attr.Host, testState.attr.Addr),
+				withBuildContext(ctx, t, "gomod-worker", worker.With(testState.updateGitconfig())),
+			)
+
+			solveResultChan := make(chan *gwclient.Result)
+			solveErrChan := make(chan error)
+			solveTCh(ctx, t, testState.client, sr, solveResultChan, solveErrChan)
+
+			var res *gwclient.Result
+			select {
+			case err := <-httpErrChan:
+				t.Fatalf("ssh server unexpededly failed: %s", err)
+			case err := <-solveErrChan:
+				t.Fatalf("solve failed: %s", err)
+			case r := <-solveResultChan:
+				res = r
+			}
+
+			outDirBase := filepath.Dir(attr.RepoAbsDir())
+			modDir := getDirName(ctx, t, res, outDirBase, "private.git@*")
+			filename := filepath.Join(outDirBase, modDir, "foo")
+			checkFile(ctx, t, filename, res, []byte("bar\n"))
+		})
+
+	}, testenv.WithSSHSocket(sshID, attr.AgentSock), testenv.WithSecrets(testenv.KeyVal{
+		K: "super-secret",
+		V: "value",
+	}), testenv.WithHostNetworking)
+}
+
 // GitServicesAttributes are the basic pieces of information needed to host two git
 // servers, one via SSH and one via HTTP
 type GitServicesAttributes struct {
@@ -180,207 +355,25 @@ func (a *GitServicesAttributes) inPrivateGitRepo(basename string) string {
 	return filepath.Join(a.RepoAbsDir(), basename)
 }
 
-func TestGomodGitAuth(t *testing.T) {
-	// 0. Test boilerplate
-	t.Parallel()
-	ctx := startTestSpan(baseCtx, t)
-	netHostBuildxEnv := testenv.NewWithNetHostBuildxInstance(ctx, t)
-	tmpDir := t.TempDir()
-	sshID := "dalecssh"
+// func (ts *TestState) createGitUser(user *string) llb.StateOption {
+// 	s := script{
+// 		basename: "create_git_user.sh",
+// 		template: `
+//                         #!/usr/bin/env sh
+//                         adduser -D -u 9999 -h {{ .ServerRoot }} {{ .GitUsername }}
+//                         chown -R {{ .GitUsername }} {{ .ServerRoot }}
+//                         printf 'abc\nabc\n' | passwd git
+//                     `,
+// 	}
 
-	const sourcename = "gitauth"
+// 	if user != nil {
+// 		*user = "git"
+// 	}
 
-	attr := GitServicesAttributes{
-		ServerRoot:             "/srv/git",
-		PrivateRepoPath:        "username/private",
-		PublicRepoPath:         "username/public",
-		HTTPServerPath:         "/usr/local/bin/git_http_server",
-		GitUsername:            "git",
-		Host:                   "host.docker.internal",
-		Addr:                   "127.0.0.1",
-		HTTPPort:               findRandomAvailablePort(t),
-		SSHPort:                findRandomAvailablePort(t),
-		AgentSock:              filepath.Join(tmpDir, "ssh.agent.sock"),
-		HTTPServerBuildDir:     "/tmp/dalec/internal/dalec_coderoot",
-		HTTPServeCodeLocalPath: "./test/cmd/git_repo",
-		OutDir:                 "/tmp/dalec/internal/output",
-	}
-
-	pubkey, privkey := generateKeyPair(t)
-	agentErrChan := startSSHAgent(t, privkey, attr.AgentSock)
-
-	// 1. Determine basic information, like the host and port for the http and
-	// ssh services; also determine the socket file location for the ssh agent
-	netHostBuildxEnv.RunTest(ctx, t, func(ctx context.Context, client gwclient.Client) {
-
-		testState := TestState{
-			t:      t,
-			ctx:    ctx,
-			client: client,
-			attr:   &attr,
-		}
-
-		// 1.5 Generate the go mod files
-		dependingModfile := file{
-			template: `
-module {{ .Host }}/{{ .PublicRepoPath }}
-
-go {{ .GoVersion }}
-
-require {{ .Host }}/{{ .PrivateRepoPath }}.git {{ .Tag }}
-`,
-		}
-
-		dependentModfile := file{
-			location: "go.mod",
-			template: `
-module {{ .Host }}/{{ .PrivateRepoPath }}.git
-
-go {{ .GoVersion }}
-            `,
-		}
-
-		worker := worker(client).With(testState.createGitUser())
-		// 2. Set up the git repository
-		// 2a. Create the files
-		repo := llb.Scratch().
-			With(testState.customFile(dependentModfile)).
-			With(testState.customFile(file{
-				location: "foo",
-				template: "bar\n",
-			})).
-			With(testState.initializedGitRepo(worker))
-
-		// 3c. Create the hosting container by loading the git repo into it
-		gitHost := worker.With(hostedRepo(repo, attr.RepoAbsDir()))
-
-		dependingModfileContents := string(dependingModfile.inject(t, &attr))
-		t.Run("SSH", func(t *testing.T) {
-			testState := testState
-			testState.t = t
-
-			const githostUsername = "git"
-			sshGitHost := gitHost
-			_ = pubkey
-			sshGitHost = gitHost.
-				With(testState.createGitUser()).
-				With(authorizedKey(pubkey, attr.ServerRoot)).
-				With(bareRepo(repo, attr.RepoAbsDir()))
-
-			sshErrChan := testState.startSSHServer(sshGitHost)
-
-			auth := dalec.GomodGitAuth{
-				SSH: &dalec.GomodGitAuthSSH{
-					ID:       sshID,
-					Username: githostUsername,
-				},
-			}
-
-			spec := testState.generateSpec(auth, dependingModfileContents)
-			sr := newSolveRequest(
-				withBuildTarget("debug/gomods"),
-				withSpec(ctx, t, spec),
-				withExtraHost(testState.attr.Host, testState.attr.Addr),
-			)
-
-			solveResultChan := make(chan *gwclient.Result)
-			solveErrChan := make(chan error)
-
-			outDirBase := testState.attr.PrivateRepoPath + "/user"
-			solveTCh(ctx, t, testState.client, sr, solveResultChan, solveErrChan)
-
-			var res *gwclient.Result
-			select {
-			case err := <-agentErrChan:
-				t.Fatalf("ssh agent unexpededly failed: %s", err)
-			case err := <-sshErrChan:
-				t.Fatalf("ssh server unexpededly failed: %s", err)
-			case err := <-solveErrChan:
-				t.Fatalf("solve failed: %s", err)
-			case r := <-solveResultChan:
-				res = r
-			}
-
-			modDir := getDirName(ctx, t, res, outDirBase, "private.git@*")
-			filename := filepath.Join(outDirBase, modDir, "foo")
-			checkFile(ctx, t, filename, res, []byte("bar\n"))
-
-			// }, testenv.WithHostNetworking, testenv.WithSSHSocket(sshID, sockfile))
-
-			// const outDirBase = gomodGitHost + "/user"
-			// res := solveT(ctx, t, c, sr)
-			// modDir := getDirName(ctx, t, res, outDirBase, "private.git@*")
-
-			// filename := filepath.Join(outDirBase, modDir, "hello")
-			// checkFile(ctx, t, filename, res, []byte("hello\n"))
-			// })
-
-		})
-
-		// 3d. Load the authorized public key into the container
-
-		// 3e. Start the SSH server
-
-		t.Run("HTTP", func(t *testing.T) {
-			testState := testState
-			testState.t = t
-
-			httpGitHost := gitHost.With(testState.updateGitconfig())
-			httpErrChan := testState.startHTTPServer(httpGitHost)
-
-			auth := dalec.GomodGitAuth{
-				Token: "super-secret",
-			}
-
-			spec := testState.generateSpec(auth, dependingModfileContents)
-
-			sr := newSolveRequest(
-				withBuildTarget("debug/gomods"),
-				withSpec(ctx, t, spec),
-				withExtraHost(testState.attr.Host, testState.attr.Addr),
-				withBuildContext(ctx, t, "gomod-worker", worker.With(testState.updateGitconfig())),
-			)
-
-			solveResultChan := make(chan *gwclient.Result)
-			solveErrChan := make(chan error)
-			solveTCh(ctx, t, testState.client, sr, solveResultChan, solveErrChan)
-
-			var res *gwclient.Result
-			select {
-			case err := <-httpErrChan:
-				t.Fatalf("ssh server unexpededly failed: %s", err)
-			case err := <-solveErrChan:
-				t.Fatalf("solve failed: %s", err)
-			case r := <-solveResultChan:
-				res = r
-			}
-
-			outDirBase := testState.attr.PrivateRepoPath + "/user"
-			modDir := getDirName(ctx, t, res, outDirBase, "private.git@*")
-			filename := filepath.Join(outDirBase, modDir, "foo")
-			checkFile(ctx, t, filename, res, []byte("bar\n"))
-		})
-
-	}, testenv.WithSSHSocket(sshID, attr.AgentSock), testenv.WithSecrets(testenv.KeyVal{
-		K: "super-secret",
-		V: "value",
-	}), testenv.WithHostNetworking)
-}
-
-func (ts *TestState) createGitUser() llb.StateOption {
-	s := script{
-		basename: "create_git_user.sh",
-		template: `
-                        #!/usr/bin/env sh
-                        adduser -D -u 9999 -h {{ .ServerRoot }} {{ .GitUsername }}
-                        chown -R {{ .GitUsername }} {{ .ServerRoot }}
-                        printf 'abc\nabc\n' | passwd git
-                    `,
-	}
-	return func(worker llb.State) llb.State {
-		return ts.runScriptOn(worker, s).Root().User(ts.attr.GitUsername)
-	}
-}
+// 	return func(worker llb.State) llb.State {
+// 		return ts.runScriptOn(worker, s).Root().User(ts.attr.GitUsername)
+// 	}
+// }
 
 func (ts *TestState) generateSpec(auth dalec.GomodGitAuth, gomodContents string) *dalec.Spec {
 	const sourceName = "gitauth"
@@ -797,9 +790,9 @@ func (ts *TestState) runScriptOn(worker llb.State, s script, runopts ...llb.RunO
 	return worker.Run(o...)
 }
 
-// initializedGitRepo returns a stateOption that uses `worker` to create an
+// initializeGitRepo returns a stateOption that uses `worker` to create an
 // initialized git repository from the base state.
-func (ts *TestState) initializedGitRepo(worker llb.State) llb.StateOption {
+func (ts *TestState) initializeGitRepo(worker llb.State) llb.StateOption {
 	attr := ts.attr
 
 	repoScript := script{
@@ -807,7 +800,7 @@ func (ts *TestState) initializedGitRepo(worker llb.State) llb.StateOption {
 		template: `
             #!/usr/bin/env sh
             rm -f /tmp/f; mkfifo /tmp/f
-            cat /tmp/f | /bin/sh -i 2>&1 | nc -lp 9999 > /tmp/f
+            # cat /tmp/f | /bin/sh -i 2>&1 | nc -lp 9999 > /tmp/f
 
             set -ex
             export GIT_CONFIG_NOGLOBAL=true
@@ -911,6 +904,7 @@ func getDirName(ctx context.Context, t *testing.T, res *gwclient.Result, base, d
 		Path:           base,
 		IncludePattern: dirPattern,
 	})
+
 	if err != nil {
 		t.Fatal(err)
 	}
