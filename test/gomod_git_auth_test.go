@@ -51,11 +51,11 @@ func TestGomodGitAuth(t *testing.T) {
 	const sourcename = "gitauth"
 
 	attr := GitServicesAttributes{
-		ServerRoot:             "/",
-		PrivateRepoPath:        "username/private",
-		PublicRepoPath:         "username/public",
-		HTTPServerPath:         "/usr/local/bin/git_http_server",
-		GitUsername:            "git",
+		ServerRoot:      "/",
+		PrivateRepoPath: "username/private",
+		PublicRepoPath:  "username/public",
+		HTTPServerPath:  "/usr/local/bin/git_http_server",
+		// GitUsername:            "git",
 		Host:                   "host.docker.internal",
 		Addr:                   "127.0.0.1",
 		HTTPPort:               findRandomAvailablePort(t),
@@ -159,9 +159,7 @@ go {{ .GoVersion }}
 				res = r
 			}
 
-			outDirBase := filepath.Join(attr.Host, filepath.Dir(attr.PrivateRepoPath))
-			modDir := getDirName(ctx, t, res, outDirBase, "private.git@*")
-			filename := filepath.Join(outDirBase, modDir, "foo")
+			filename := calculateFilename(ctx, t, attr, res)
 			checkFile(ctx, t, filename, res, []byte("bar\n"))
 		})
 
@@ -203,9 +201,7 @@ go {{ .GoVersion }}
 				res = r
 			}
 
-			outDirBase := filepath.Join(attr.Host, filepath.Dir(attr.PrivateRepoPath))
-			modDir := getDirName(ctx, t, res, outDirBase, "private.git@*")
-			filename := filepath.Join(outDirBase, modDir, "foo")
+			filename := calculateFilename(ctx, t, attr, res)
 			checkFile(ctx, t, filename, res, []byte("bar\n"))
 		})
 
@@ -213,6 +209,13 @@ go {{ .GoVersion }}
 		K: "super-secret",
 		V: "value",
 	}), testenv.WithHostNetworking)
+}
+
+func calculateFilename(ctx context.Context, t *testing.T, attr GitServicesAttributes, res *gwclient.Result) string {
+	outDirBase := filepath.Join(attr.Host, filepath.Dir(attr.PrivateRepoPath))
+	modDir := getDirName(ctx, t, res, outDirBase, "private.git@*")
+	filename := filepath.Join(outDirBase, modDir, "foo")
+	return filename
 }
 
 // GitServicesAttributes are the basic pieces of information needed to host two git
@@ -231,7 +234,6 @@ type GitServicesAttributes struct {
 	// HTTP Server path is the filesystem path of the already-built HTTP
 	// server, installed into its final location.
 	HTTPServerPath string
-	GitUsername    string
 
 	// Host is the hostname of the git server
 	Host string
@@ -260,6 +262,14 @@ type GitServicesAttributes struct {
 
 func (g *GitServicesAttributes) PrivateRepoAbsPath() string {
 	return filepath.Join(g.ServerRoot, g.PrivateRepoPath)
+}
+
+func (g *GitServicesAttributes) HTTPServerDir() string {
+	return filepath.Dir(g.HTTPServerPath)
+}
+
+func (g *GitServicesAttributes) HTTPServerBase() string {
+	return filepath.Base(g.HTTPServerPath)
 }
 
 type TestState struct {
@@ -426,7 +436,7 @@ func (ts *TestState) startHTTPServer(gitHost llb.State) chan error {
             #!/usr/bin/env sh
 
             set -ex
-            exec {{ .HTTPServerPath }}/git_http_server / {{ .Addr }} {{ .HTTPPort }}
+            exec {{ .HTTPServerPath }} {{ .ServerRoot }} {{ .Addr }} {{ .HTTPPort }}
         `,
 	}
 
@@ -444,16 +454,16 @@ func (ts *TestState) startHTTPServer(gitHost llb.State) chan error {
 	}
 
 	httpServerBin := ts.getMainDockerContext().
-		With(ts.builtHTTPServer(gitHost))
+		With(ts.buildHTTPServer(gitHost))
 
 	gitHost = gitHost.
 		With(ts.customScript(serverScript)).
-		With(ts.customScript(waitScript))
+		With(ts.customScript(waitScript)).
+		File(
+			llb.Copy(httpServerBin, "/", ts.attr.HTTPServerDir()),
+		)
 
-	cont := ts.newContainer(gitHost, customMount{
-		dst: ts.attr.HTTPServerPath,
-		st:  httpServerBin,
-	})
+	cont := ts.newContainer(gitHost)
 
 	env := ts.getStateEnv(gitHost)
 	errChan := ts.runContainer(cont, env, serverScript)
@@ -469,7 +479,7 @@ func (ts *TestState) startHTTPServer(gitHost llb.State) chan error {
 	return errChan
 }
 
-func (ts *TestState) builtHTTPServer(worker llb.State) llb.StateOption {
+func (ts *TestState) buildHTTPServer(worker llb.State) llb.StateOption {
 	s := script{
 		basename: "build_http_server.sh",
 		template: `
