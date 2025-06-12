@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,12 +19,10 @@ import (
 
 	"github.com/moby/buildkit/client"
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
-	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/secrets/secretsprovider"
 	"github.com/moby/buildkit/session/sshforward/sshprovider"
 	"github.com/moby/buildkit/solver/pb"
 	spb "github.com/moby/buildkit/sourcepolicy/pb"
-	"github.com/opencontainers/go-digest"
 	pkgerrors "github.com/pkg/errors"
 	"google.golang.org/protobuf/proto"
 	"gotest.tools/v3/assert"
@@ -279,7 +276,7 @@ func WithSecrets(kvs ...KeyVal) TestRunnerOpt {
 			for _, kv := range kvs {
 				m[kv.K] = []byte(kv.V)
 			}
-			so.Session = []session.Attachable{secretsprovider.FromMap(m)}
+			so.Session = append(so.Session, secretsprovider.FromMap(m))
 		})
 	}
 }
@@ -296,7 +293,7 @@ func WithSSHSocket(id, addr string) TestRunnerOpt {
 			panic(err)
 		}
 		cfg.SolveOptFns = append(cfg.SolveOptFns, func(so *client.SolveOpt) {
-			so.Session = []session.Attachable{a}
+			so.Session = append(so.Session, a)
 		})
 	}
 }
@@ -379,17 +376,7 @@ var (
 )
 
 func NewWithNetHostBuildxInstance(ctx context.Context, t *testing.T) *BuildxEnv {
-	dgst := digest.Canonical.Encode([]byte(t.Name()))
-
-	var randomBytes [8]byte
-	_, err := rand.Read(randomBytes[:])
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	dgst2 := digest.Canonical.Encode(randomBytes[:])
-	name := "dalec_integration_test_" + dgst[:12] + dgst2
-
+	name := "dalec_integration_test"
 	netHostTestEnvOnce.Do(func() {
 		netHostTestEnv = New().WithBuilder(name)
 		ctxT, cancel := context.WithTimeout(ctx, 5*time.Second)

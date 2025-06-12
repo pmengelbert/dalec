@@ -70,7 +70,6 @@ func withGomod(g *SourceGenerator, srcSt, worker llb.State, credHelper llb.RunOp
 				llb.AddEnv("GOPATH", "/go"),
 				credHelper,
 				llb.AddEnv("TMP_GOMODCACHE", proxyPath),
-				llb.AddEnv("SSH_AUTH_SOCK", "/sshsock/S.gpg-agent.ssh"),
 				llb.AddEnv("GIT_SSH_COMMAND", "ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no"),
 				llb.Dir(filepath.Join(joinedWorkDir, path)),
 				srcMount,
@@ -131,7 +130,7 @@ func (g *SourceGenerator) gitconfigGeneratorScript(scriptPath string) llb.State 
 
 	fmt.Fprintf(&script, "go env -w GOPRIVATE=%s", strings.Join(goPrivate, ","))
 	script.WriteRune('\n')
-	fmt.Fprintln(&script, "go mod download")
+	fmt.Fprintln(&script, "go mod download -x")
 	return llb.Scratch().File(llb.Mkfile(scriptPath, 0o755, script.Bytes()))
 }
 
