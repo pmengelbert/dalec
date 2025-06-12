@@ -114,28 +114,26 @@ go {{ .GoVersion }}
 		// 3c. Create the hosting container by loading the git repo into it
 		gitHost := worker.With(hostedRepo(repo, attr.RepoAbsDir()))
 
+		sshGitHost := gitHost.
+			With(authorizedKey(pubkey, "/root")).
+			With(bareRepo(repo, attr.RepoAbsDir()))
+
+		httpGitHost := gitHost.With(testState.updatedGitconfig())
+
 		dependingModfileContents := string(dependingModfile.inject(t, &attr))
 		t.Run("SSH", func(t *testing.T) {
 			testState := testState
 			testState.t = t
 
 			const githostUsername = "root"
-			sshGitHost := gitHost
-			_ = pubkey
-			sshGitHost = gitHost.
-				With(authorizedKey(pubkey, "/root")).
-				With(bareRepo(repo, attr.RepoAbsDir()))
-
 			sshErrChan := testState.startSSHServer(sshGitHost)
 
-			auth := dalec.GomodGitAuth{
+			spec := testState.generateSpec(dependingModfileContents, dalec.GomodGitAuth{
 				SSH: &dalec.GomodGitAuthSSH{
 					ID:       sshID,
 					Username: githostUsername,
 				},
-			}
-
-			spec := testState.generateSpec(auth, dependingModfileContents)
+			})
 			sr := newSolveRequest(
 				withBuildTarget("debug/gomods"),
 				withSpec(ctx, t, spec),
@@ -171,20 +169,17 @@ go {{ .GoVersion }}
 			testState := testState
 			testState.t = t
 
-			httpGitHost := gitHost.With(testState.updateGitconfig())
 			httpErrChan := testState.startHTTPServer(httpGitHost)
 
-			auth := dalec.GomodGitAuth{
+			spec := testState.generateSpec(dependingModfileContents, dalec.GomodGitAuth{
 				Token: "super-secret",
-			}
-
-			spec := testState.generateSpec(auth, dependingModfileContents)
+			})
 
 			sr := newSolveRequest(
 				withBuildTarget("debug/gomods"),
 				withSpec(ctx, t, spec),
 				withExtraHost(testState.attr.Host, testState.attr.Addr),
-				withBuildContext(ctx, t, "gomod-worker", worker.With(testState.updateGitconfig())),
+				withBuildContext(ctx, t, "gomod-worker", worker.With(testState.updatedGitconfig())),
 			)
 
 			solveResultChan := make(chan *gwclient.Result)
@@ -386,7 +381,7 @@ func (a *GitServicesAttributes) inPrivateGitRepo(basename string) string {
 // 	}
 // }
 
-func (ts *TestState) generateSpec(auth dalec.GomodGitAuth, gomodContents string) *dalec.Spec {
+func (ts *TestState) generateSpec(gomodContents string, auth dalec.GomodGitAuth) *dalec.Spec {
 	const sourceName = "gitauth"
 	var port string
 
@@ -876,24 +871,6 @@ func startSSHAgent(t *testing.T, privkey crypto.PrivateKey, sockaddr string) cha
 	return ec
 }
 
-// func testGomodGitAuthGeneric(t *testing.T, ctx context.Context, buildEnv *testenv.BuildxEnv, auth dalec.GomodGitAuth) {
-// 	t.Parallel()
-// 	ctx = startTestSpan(ctx, t)
-// 	tag := identity.NewID()
-
-// 	dependingGomodFileContents := generateGoDotModFileContents(t, dependingModfileTemplate, tag)
-// 	port := getAvailablePort(t)
-// 	hostPort := fmt.Sprintf("%s:%s", gomodGitHost, port)
-
-// 	// spec :=
-// }
-
-// func gomodGitAuthTest(t *testing.T, parentCtx context.Context, buildEnv *testenv.BuildxEnv, spec *dalec.Spec) {
-// 	ctx := startTestSpan(parentCtx, t)
-// 	tag := identity.NewID()
-
-// }
-
 func generateKeyPair(t *testing.T) (ssh.PublicKey, crypto.PrivateKey) {
 	u, privkey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -938,7 +915,7 @@ func worker(c gwclient.Client) llb.State {
 	return worker
 }
 
-func (ts *TestState) updateGitconfig() llb.StateOption {
+func (ts *TestState) updatedGitconfig() llb.StateOption {
 	s := script{
 		basename: "update_gitconfig.sh",
 		template: `
