@@ -203,7 +203,7 @@ go {{ .GoVersion }}
 				res = r
 			}
 
-			outDirBase := filepath.Dir(attr.RepoAbsDir())
+			outDirBase := filepath.Join(attr.Host, filepath.Dir(attr.PrivateRepoPath))
 			modDir := getDirName(ctx, t, res, outDirBase, "private.git@*")
 			filename := filepath.Join(outDirBase, modDir, "foo")
 			checkFile(ctx, t, filename, res, []byte("bar\n"))
@@ -284,8 +284,9 @@ func (s *script) absPath() string {
 }
 
 func (s *script) inject(t *testing.T, obj *GitServicesAttributes) []byte {
+	tmpl := "#!/usr/bin/env sh\n" + s.template
 	f := file{
-		template: s.template,
+		template: tmpl,
 	}
 
 	return f.inject(t, obj)
@@ -423,7 +424,9 @@ func (ts *TestState) startHTTPServer(gitHost llb.State) chan error {
 		basename: "run_http_server.sh",
 		template: `
             #!/usr/bin/env sh
-            exec {{ .HTTPServerPath }}/git_http_server
+
+            set -ex
+            exec {{ .HTTPServerPath }}/git_http_server / {{ .Addr }} {{ .HTTPPort }}
         `,
 	}
 
@@ -444,6 +447,7 @@ func (ts *TestState) startHTTPServer(gitHost llb.State) chan error {
 		With(ts.builtHTTPServer(gitHost))
 
 	gitHost = gitHost.
+		With(ts.customScript(serverScript)).
 		With(ts.customScript(waitScript))
 
 	cont := ts.newContainer(gitHost, customMount{
@@ -458,6 +462,7 @@ func (ts *TestState) startHTTPServer(gitHost llb.State) chan error {
 
 	timeout := waitOnlineTimeout
 	ts.runWaitScript(cont, env, waitScript, timeout)
+	// time.Sleep(time.Second * 86400)
 
 	t.Logf("http server is online")
 
@@ -471,7 +476,7 @@ func (ts *TestState) builtHTTPServer(worker llb.State) llb.StateOption {
             #!/usr/bin/env sh
             set -ex
             cd {{ .HTTPServerBuildDir }}
-            go build -o {{ .OutDir }}/host ./{{ .HTTPServeCodeLocalPath }}
+            go build -o {{ .OutDir }}/git_http_server ./{{ .HTTPServeCodeLocalPath }}
         `,
 	}
 
@@ -694,6 +699,7 @@ func (ts *TestState) runContainer(cont gwclient.Container, env []string, s scrip
 	stdout := bufCloser{bytes.NewBuffer(nil)}
 	stderr := bufCloser{bytes.NewBuffer(nil)}
 
+	ts.t.Log("listening")
 	cp, err := cont.Start(ctx, gwclient.StartRequest{
 		Args:   []string{s.absPath()},
 		Env:    env,
@@ -799,8 +805,6 @@ func (ts *TestState) initializeGitRepo(worker llb.State) llb.StateOption {
 		basename: "git_init.sh",
 		template: `
             #!/usr/bin/env sh
-            rm -f /tmp/f; mkfifo /tmp/f
-            # cat /tmp/f | /bin/sh -i 2>&1 | nc -lp 9999 > /tmp/f
 
             set -ex
             export GIT_CONFIG_NOGLOBAL=true
