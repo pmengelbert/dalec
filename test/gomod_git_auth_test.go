@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -41,7 +42,6 @@ const (
 )
 
 func TestGomodGitAuth(t *testing.T) {
-	// 0. Test boilerplate
 	t.Parallel()
 	ctx := startTestSpan(baseCtx, t)
 	netHostBuildxEnv := testenv.NewWithNetHostBuildxInstance(ctx, t)
@@ -61,7 +61,6 @@ func TestGomodGitAuth(t *testing.T) {
 		HTTPServerBuildDir:     "/tmp/dalec/internal/dalec_coderoot",
 		HTTPServeCodeLocalPath: "./test/cmd/git_repo",
 		OutDir:                 "/tmp/dalec/internal/output",
-		Tag:                    "", // this
 	}
 
 	dependingModfile := file{
@@ -83,33 +82,42 @@ go {{ .GoVersion }}
             `,
 	}
 
-	dependingModfileContents := string(dependingModfile.inject(t, &attr))
+	initStates := func(ts *TestState) (llb.State, llb.State, llb.State) {
+		worker := initWorker(ts.client())
+		repo := llb.Scratch().
+			With(ts.customFile(dependentModfile)).
+			With(ts.customFile(file{
+				location: "foo",
+				template: "bar\n",
+			})).
+			With(ts.initializeGitRepo(worker))
+
+		// 3c. Create the hosting container by loading the git repo into it
+		gitHost := worker.With(hostedRepo(repo, ts.attr.RepoAbsDir()))
+
+		return worker, repo, gitHost
+	}
+
+	pubkey, privkey := generateKeyPair(t)
+	sockaddr, _ := getSocketAddr(t)
+	// defer cleanup()
+
 	t.Run("HTTP", func(t *testing.T) {
 		t.Parallel()
 		netHostBuildxEnv.RunTest(ctx, t, func(ctx context.Context, client gwclient.Client) {
-			attr := attr
-			attr.Tag = identity.NewID()
+			attr := attr.WithNewTag()
 			testState := TestState{
 				t:       t,
 				ctx:     ctx,
 				_client: client,
-				attr:    attr,
+				attr:    *attr,
 			}
 
-			worker := initWorker(testState.client())
-			repo := llb.Scratch().
-				With(testState.customFile(dependentModfile)).
-				With(testState.customFile(file{
-					location: "foo",
-					template: "bar\n",
-				})).
-				With(testState.initializeGitRepo(worker))
-
-			// 3c. Create the hosting container by loading the git repo into it
-			gitHost := worker.With(hostedRepo(repo, attr.RepoAbsDir()))
+			worker, _, gitHost := initStates(&testState)
 			httpGitHost := gitHost.With(testState.updatedGitconfig())
 			httpErrChan := testState.startHTTPServer(httpGitHost)
 
+			dependingModfileContents := string(dependingModfile.inject(t, attr))
 			spec := testState.generateSpec(dependingModfileContents, dalec.GomodGitAuth{
 				Token: "super-secret",
 			})
@@ -137,7 +145,7 @@ go {{ .GoVersion }}
 
 			filename := calculateFilename(ctx, t, attr, res)
 			checkFile(ctx, t, filename, res, []byte("bar\n"))
-		}, testenv.WithSSHSocket(sshID, attr.AgentSock), testenv.WithSecrets(testenv.KeyVal{
+		}, testenv.WithSecrets(testenv.KeyVal{
 			K: "super-secret",
 			V: "value",
 		}), testenv.WithHostNetworking)
@@ -147,40 +155,23 @@ go {{ .GoVersion }}
 		t.Parallel()
 
 		netHostBuildxEnv.RunTest(ctx, t, func(ctx context.Context, client gwclient.Client) {
-			attr := attr
-			attr.Tag = identity.NewID()
-			attr.AgentSock = filepath.Join(t.TempDir(), "ssh.agent.sock")
-
-			pubkey, privkey := generateKeyPair(t)
-			agentErrChan := startSSHAgent(t, privkey, attr.AgentSock)
-
+			attr := attr.WithNewTag()
 			testState := TestState{
 				t:       t,
 				ctx:     ctx,
 				_client: client,
-				attr:    attr,
+				attr:    *attr,
 			}
 
-			worker := initWorker(testState.client())
-			// 2. Set up the git repository
-			// 2a. Create the files
-			repo := llb.Scratch().
-				With(testState.customFile(dependentModfile)).
-				With(testState.customFile(file{
-					location: "foo",
-					template: "bar\n",
-				})).
-				With(testState.initializeGitRepo(worker))
-
-			// 3c. Create the hosting container by loading the git repo into it
-			gitHost := worker.With(hostedRepo(repo, attr.RepoAbsDir()))
-
+			agentErrChan := startSSHAgent(t, privkey, sockaddr)
+			_, repo, gitHost := initStates(&testState)
 			sshGitHost := gitHost.
 				With(authorizedKey(pubkey, "/root")).
 				With(bareRepo(repo, attr.RepoAbsDir()))
 
 			const githostUsername = "root"
 			sshErrChan := testState.startSSHServer(sshGitHost)
+			dependingModfileContents := string(dependingModfile.inject(t, attr))
 
 			spec := testState.generateSpec(dependingModfileContents, dalec.GomodGitAuth{
 				SSH: &dalec.GomodGitAuthSSH{
@@ -213,18 +204,34 @@ go {{ .GoVersion }}
 
 			filename := calculateFilename(ctx, t, attr, res)
 			checkFile(ctx, t, filename, res, []byte("bar\n"))
-		}, testenv.WithSSHSocket(sshID, attr.AgentSock), testenv.WithSecrets(testenv.KeyVal{
+		}, testenv.WithSSHSocket(sshID, sockaddr), testenv.WithSecrets(testenv.KeyVal{
 			K: "super-secret",
 			V: "value",
 		}), testenv.WithHostNetworking)
 	})
 }
 
-func calculateFilename(ctx context.Context, t *testing.T, attr GitServicesAttributes, res *gwclient.Result) string {
+func getSocketAddr(t *testing.T) (string, func()) {
+	dir, err := os.MkdirTemp("/tmp", "dalec-ssh-agent")
+	if err != nil {
+		t.Fatal("could not create temporary directory for socket")
+	}
+
+	sockaddr := filepath.Join(dir, "ssh.agent.sock")
+	return sockaddr, func() { _ = os.RemoveAll(dir) }
+}
+
+func calculateFilename(ctx context.Context, t *testing.T, attr *GitServicesAttributes, res *gwclient.Result) string {
 	outDirBase := filepath.Join(attr.Host, filepath.Dir(attr.PrivateRepoPath))
 	modDir := getDirName(ctx, t, res, outDirBase, "private.git@*")
 	filename := filepath.Join(outDirBase, modDir, "foo")
 	return filename
+}
+
+func copyAttr(g *GitServicesAttributes) GitServicesAttributes {
+	gg := new(GitServicesAttributes)
+	*gg = *g
+	return *gg
 }
 
 // GitServicesAttributes are the basic pieces of information needed to host two git
@@ -243,8 +250,6 @@ type GitServicesAttributes struct {
 	// HTTP Server path is the filesystem path of the already-built HTTP
 	// server, installed into its final location.
 	HTTPServerPath string
-	// Tag is the git tag. It must be unique for each test, or otherwise it will be cached between tests.
-	Tag string
 
 	// Host is the hostname of the git server
 	Host string
@@ -255,8 +260,6 @@ type GitServicesAttributes struct {
 	HTTPPort string
 	// SSHPort is the port on which the ssh git server runs
 	SSHPort string
-	// AgentSock is the filesystem path of the socket exposed by the SSH agent
-	AgentSock string
 
 	// HTTPServerBuildDir is the location at which the HTTP server program's
 	// code will be loaded for building
@@ -266,6 +269,9 @@ type GitServicesAttributes struct {
 	HTTPServeCodeLocalPath string
 	// OutDir is the location to which dalec will output files
 	OutDir string
+
+	// _tag is a private field and should not be accessed directly
+	_tag string
 }
 
 func (g *GitServicesAttributes) PrivateRepoAbsPath() string {
@@ -366,6 +372,21 @@ func cleanWhitespace(s string) string {
 	return b.String()
 }
 
+func (a *GitServicesAttributes) Tag() string {
+	return a._tag
+}
+
+func (a *GitServicesAttributes) WithNewTag() *GitServicesAttributes {
+	if a == nil {
+		return &GitServicesAttributes{_tag: identity.NewID()}
+	}
+
+	b := *a
+	b._tag = identity.NewID()
+
+	return &b
+}
+
 func (a *GitServicesAttributes) RepoAbsDir() string {
 	return filepath.Join(a.ServerRoot, a.PrivateRepoPath)
 }
@@ -373,6 +394,26 @@ func (a *GitServicesAttributes) RepoAbsDir() string {
 func (a *GitServicesAttributes) inPrivateGitRepo(basename string) string {
 	return filepath.Join(a.RepoAbsDir(), basename)
 }
+
+// func (ts *TestState) createGitUser(user *string) llb.StateOption {
+// 	s := script{
+// 		basename: "create_git_user.sh",
+// 		template: `
+//                         #!/usr/bin/env sh
+//                         adduser -D -u 9999 -h {{ .ServerRoot }} {{ .GitUsername }}
+//                         chown -R {{ .GitUsername }} {{ .ServerRoot }}
+//                         printf 'abc\nabc\n' | passwd git
+//                     `,
+// 	}
+
+// 	if user != nil {
+// 		*user = "git"
+// 	}
+
+// 	return func(worker llb.State) llb.State {
+// 		return ts.runScriptOn(worker, s).Root().User(ts.attr.GitUsername)
+// 	}
+// }
 
 func (ts *TestState) generateSpec(gomodContents string, auth dalec.GomodGitAuth) *dalec.Spec {
 	const sourceName = "gitauth"
@@ -834,6 +875,7 @@ func startSSHAgent(t *testing.T, privkey crypto.PrivateKey, sockaddr string) cha
 		PrivateKey: privkey,
 	})
 
+	t.Logf("starting ssh agent on socket %s", sockaddr)
 	listener, err := net.Listen("unix", sockaddr)
 	if err != nil {
 		t.Fatalf("can't listen on unix socket: %s", err)
@@ -895,8 +937,6 @@ func getDirName(ctx context.Context, t *testing.T, res *gwclient.Result, base, d
 	if len(stats) == 0 {
 		t.Fatalf("private go module directory not found")
 	}
-
-	t.Logf("HERE: %v", stats)
 
 	return stats[0].Path
 }
