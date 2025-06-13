@@ -99,8 +99,6 @@ go {{ .GoVersion }}
 	}
 
 	pubkey, privkey := generateKeyPair(t)
-	sockaddr, _ := getSocketAddr(t)
-	// defer cleanup()
 
 	t.Run("HTTP", func(t *testing.T) {
 		t.Parallel()
@@ -151,8 +149,11 @@ go {{ .GoVersion }}
 		}), testenv.WithHostNetworking)
 	})
 
+	sockaddr, cleanup := getSocketAddr(t)
+	agentErrChan := startSSHAgent(t, privkey, sockaddr)
 	t.Run("SSH", func(t *testing.T) {
 		t.Parallel()
+		defer cleanup()
 
 		netHostBuildxEnv.RunTest(ctx, t, func(ctx context.Context, client gwclient.Client) {
 			attr := attr.WithNewTag()
@@ -163,7 +164,6 @@ go {{ .GoVersion }}
 				attr:    *attr,
 			}
 
-			agentErrChan := startSSHAgent(t, privkey, sockaddr)
 			_, repo, gitHost := initStates(&testState)
 			sshGitHost := gitHost.
 				With(authorizedKey(pubkey, "/root")).
